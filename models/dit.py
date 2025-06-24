@@ -1,6 +1,7 @@
 import math
 import typing
-
+# https://github.com/facebookresearch/DiT/blob/main/models.py
+# https://arxiv.org/pdf/2212.09748
 try:
     import flash_attn
     from flash_attn.layers.rotary import apply_rotary_emb_qkv_
@@ -249,9 +250,11 @@ class LabelEmbedder(nn.Module):
 
 
 class DDiTBlock(nn.Module):
-  def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1):
+  def __init__(self, dim, n_heads, cond_dim, mlp_ratio=4, dropout=0.1, use_adaLN: bool = True):
     super().__init__()
     self.n_heads = n_heads
+    self.dim = dim
+    self.use_adaLN = use_adaLN
 
     self.norm1 = LayerNorm(dim)
     self.attn_qkv = nn.Linear(dim, 3 * dim, bias=False)
@@ -266,9 +269,12 @@ class DDiTBlock(nn.Module):
     self.dropout2 = nn.Dropout(dropout)
     self.dropout = dropout
 
-    self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim, bias=True)
-    self.adaLN_modulation.weight.data.zero_()
-    self.adaLN_modulation.bias.data.zero_()
+    if self.use_adaLN:
+      self.adaLN_modulation = nn.Linear(cond_dim, 6 * dim, bias=True)
+      self.adaLN_modulation.weight.data.zero_()
+      self.adaLN_modulation.bias.data.zero_()
+    else:
+      self.register_buffer("adaLN_modulation", None)
 
 
   def _get_bias_dropout_scale(self):
@@ -283,8 +289,16 @@ class DDiTBlock(nn.Module):
 
     bias_dropout_scale_fn = self._get_bias_dropout_scale()
 
-    (shift_msa, scale_msa, gate_msa, shift_mlp,
-     scale_mlp, gate_mlp) = self.adaLN_modulation(c)[:, None].chunk(6, dim=2)
+    if self.use_adaLN and c is not None:
+      (shift_msa, scale_msa, gate_msa,
+       shift_mlp, scale_mlp, gate_mlp) = (
+          self.adaLN_modulation(c)[:, None].chunk(6, dim=2))
+    else:
+      zeros = torch.zeros(batch_size, 1, self.dim,
+                          device=x.device, dtype=x.dtype)
+      ones = torch.ones_like(zeros)
+      shift_msa = scale_msa = shift_mlp = scale_mlp = zeros
+      gate_msa = gate_mlp = ones
 
     # attention operation
     x_skip = x
@@ -370,13 +384,19 @@ class DDitFinalLayer(nn.Module):
 
 
   def forward(self, x, c):
-    shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
+    if c is None:
+      shift = scale = torch.zeros(x.size(0), 1, x.size(-1),
+                                  device=x.device, dtype=x.dtype)
+    else:
+      shift, scale = self.adaLN_modulation(c)[:, None].chunk(2, dim=2)
     x = modulate_fused(self.norm_final(x), shift, scale)
     x = self.linear(x)
     return x
 
 
 class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
+  # https://github.com/facebookresearch/DiT/blob/main/models.py
+  # https://arxiv.org/pdf/2212.09748
   def __init__(self, config, vocab_size: int):
     super().__init__()
     if type(config) == dict:
@@ -396,7 +416,7 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       blocks.append(DDiTBlock(config.model.hidden_size,
                               config.model.n_heads,
                               config.model.cond_dim,
-                              dropout=config.model.dropout))
+                              dropout=config.model.dropout))  # use_adaLN defaults to True
     self.blocks = nn.ModuleList(blocks)
 
     self.output_layer = DDitFinalLayer(
@@ -423,3 +443,187 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       x = self.output_layer(x, c)
 
     return x
+class DITClassifier(nn.Module):
+  def __init__(self, config, vocab_size, time_conditioning=False):
+    super().__init__()
+    if type(config) == dict:
+      config = omegaconf.OmegaConf.create(config)
+
+    self.config = config
+    self.vocab_size = vocab_size
+    self.time_dependent = time_conditioning
+
+    self.vocab_embed = EmbeddingLayer(
+      config.classifier_model.hidden_size, vocab_size)
+
+    if not self.time_dependent:
+      self.sigma_map = None
+    else:
+      self.sigma_map = TimestepEmbedder(config.classifier_model.cond_dim)
+
+    self.rotary_emb = Rotary(
+      config.classifier_model.hidden_size // config.classifier_model.n_heads)
+
+    blocks = []
+    for _ in range(config.classifier_model.n_blocks):
+      blocks.append(
+        DDiTBlock(config.classifier_model.hidden_size,
+                  config.classifier_model.n_heads,
+                  config.classifier_model.cond_dim,
+                  dropout=config.classifier_model.dropout,
+                  use_adaLN=self.time_dependent))
+    self.blocks = nn.ModuleList(blocks)
+
+    self.scale_by_sigma = config.classifier_model.scale_by_sigma
+
+    self.pooling = getattr(config.classifier_model, 'pooling', 'mean')
+    self.output_layer = nn.Linear(
+      config.classifier_model.hidden_size,
+      1)
+
+  def _get_bias_dropout_scale(self):
+    if self.training:
+      return bias_dropout_add_scale_fused_train
+    else:
+      return  bias_dropout_add_scale_fused_inference
+
+  def forward(self, indices_or_one_hots, sigma=None, x_emb=None, attention_mask=None):
+    if x_emb is None:
+      if indices_or_one_hots.ndim == 2:  # indices (B, L)
+        x = self.vocab_embed(indices_or_one_hots)
+      else:  # one-hots (B, L, V)
+        x = F.linear(indices_or_one_hots.to(torch.float),
+                     self.vocab_embed.embedding.T)
+
+      if not self.time_dependent:
+        c = None
+      else:
+        c = F.silu(self.sigma_map(sigma))
+
+      rotary_cos_sin = self.rotary_emb(x)
+
+      with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        for i in range(len(self.blocks)):
+          x = self.blocks[i](x, rotary_cos_sin, c,
+                             seqlens=None)
+    else:
+      x = x_emb
+
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+      if self.pooling == 'mean':
+        x = x.mean(dim=1)
+      elif self.pooling == 'max':
+        x = x.max(dim=1)
+      elif self.pooling == 'cls':
+        x = x[..., 0]
+      elif self.pooling == 'last':
+        x = x[..., -1]
+      elif self.pooling == 'no_pooling':  # for ar_fudge
+        pass
+      elif self.pooling == 'attention_mean':  # for ar_pplm
+        masked_x = x * attention_mask.unsqueeze(2)
+        x = torch.sum(masked_x, dim=1) / (torch.sum(attention_mask, dim=1, keepdim=True) + 1e-15)
+      else:
+        raise NotImplementedError(
+          f"`{self.pooling}` method not implemented.")
+      x = self.output_layer(x)
+    return x
+
+  def load_pretrained_encoder(self, encoder: nn.Module):
+    self.vocab_embed = encoder.vocab_embed
+    self.sigma_map = encoder.sigma_map
+    self.rotary_emb = encoder.rotary_emb
+    self.blocks = encoder.blocks
+
+
+class DITRatio(nn.Module):
+  def __init__(self, config, vocab_size, time_conditioning=False):
+    super().__init__()
+    if type(config) == dict:
+      config = omegaconf.OmegaConf.create(config)
+
+    self.config = config
+    self.vocab_size = vocab_size
+    self.time_dependent = time_conditioning
+
+    self.vocab_embed = EmbeddingLayer(
+      config.ratio_model.hidden_size, vocab_size)
+
+    if not self.time_dependent:
+      self.sigma_map = None
+    else:
+      self.sigma_map = TimestepEmbedder(config.ratio_model.cond_dim)
+
+    self.rotary_emb = Rotary(
+      config.classifier_model.hidden_size // config.ratio_model.n_heads)
+
+    blocks = []
+    for _ in range(config.ratio_model.n_blocks):
+      blocks.append(
+        DDiTBlock(config.ratio_model.hidden_size,
+                  config.ratio_model.n_heads,
+                  config.ratio_model.cond_dim,
+                  dropout=config.ratio_model.dropout,
+                  use_adaLN=self.time_dependent))
+    self.blocks = nn.ModuleList(blocks)
+
+    self.scale_by_sigma = config.ratio_model.scale_by_sigma
+
+    self.pooling = getattr(config.ratio_model, 'pooling', 'mean')
+    self.output_layer = nn.Linear(
+      config.ratio_model.hidden_size,
+      config.ratio_model.num_classes)
+
+  def _get_bias_dropout_scale(self):
+    if self.training:
+      return bias_dropout_add_scale_fused_train
+    else:
+      return  bias_dropout_add_scale_fused_inference
+
+  def forward(self, indices_or_one_hots, sigma=None, x_emb=None, attention_mask=None):
+    if x_emb is None:
+      if indices_or_one_hots.ndim == 2:  # indices (B, L)
+        x = self.vocab_embed(indices_or_one_hots)
+      else:  # one-hots (B, L, V)
+        x = F.linear(indices_or_one_hots.to(torch.float),
+                     self.vocab_embed.embedding.T)
+
+      if not self.time_dependent:
+        c = None
+      else:
+        c = F.silu(self.sigma_map(sigma))
+
+      rotary_cos_sin = self.rotary_emb(x)
+
+      with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+        for i in range(len(self.blocks)):
+          x = self.blocks[i](x, rotary_cos_sin, c,
+                             seqlens=None)
+    else:
+      x = x_emb
+
+    with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+      if self.pooling == 'mean':
+        x = x.mean(dim=1)
+      elif self.pooling == 'max':
+        x = x.max(dim=1)
+      elif self.pooling == 'cls':
+        x = x[..., 0]
+      elif self.pooling == 'last':
+        x = x[..., -1]
+      elif self.pooling == 'no_pooling':  # for ar_fudge
+        pass
+      elif self.pooling == 'attention_mean':  # for ar_pplm
+        masked_x = x * attention_mask.unsqueeze(2)
+        x = torch.sum(masked_x, dim=1) / (torch.sum(attention_mask, dim=1, keepdim=True) + 1e-15)
+      else:
+        raise NotImplementedError(
+          f"`{self.pooling}` method not implemented.")
+      x = self.output_layer(x)
+    return x
+
+  def load_pretrained_encoder(self, encoder: nn.Module):
+    self.vocab_embed = encoder.vocab_embed
+    self.sigma_map = encoder.sigma_map
+    self.rotary_emb = encoder.rotary_emb
+    self.blocks = encoder.blocks

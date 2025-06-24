@@ -6,11 +6,33 @@ Copied from https://docs.python.org/3/howto/logging-cookbook.html#using-a-contex
 
 import logging
 import math
-
+import os
 import fsspec
 import lightning
 import torch
 from timm.scheduler import CosineLRScheduler
+
+
+def filter_arxiv_dataset_by_domain(dataset, domain_key):
+  """
+  Filter an arXiv metadata Dataset to only include records whose
+  *primary* category prefix matches domain_key.
+  """
+  if not domain_key:
+    return dataset
+
+  def _matches_primary(example):
+    cats = example.get("categories")
+    # get list of tags
+    tags = cats.split() if isinstance(cats, str) else cats if isinstance(cats, list) else []
+    if not tags:
+      return False
+    # only inspect the first (primary) tag
+    primary = tags[0]
+    prefix = primary.split('.', 1)[0]
+    return prefix == domain_key
+
+  return dataset.filter(_matches_primary)
 
 
 def fsspec_exists(filename):
@@ -91,6 +113,54 @@ class LoggingContext:
       self.logger.removeHandler(self.handler)
     if self.handler and self.close:
       self.handler.close()
+
+# ── helpers ─────────────────────────────────────────────────────────────
+def _unwrap_dataset(ds):
+    while hasattr(ds, "dataset"):
+        ds = ds.dataset
+    return ds
+
+def _infer_wrap_from_filename(loader):
+    """
+    Return True / False if the cached filename tells us,
+    otherwise return None (meaning “unknown”).
+    """
+    ds = _unwrap_dataset(loader.dataset)
+    if getattr(ds, "cache_files", None):
+        fname = ds.cache_files[0]["filename"]
+        if "_wrapped.dat"   in fname: return True
+        if "_unwrapped.dat" in fname: return False
+    return None   # no hint found
+# ── main check ──────────────────────────────────────────────────────────
+def make_checks_if_config_and_loader_is_synchronized(config, *dataloaders):
+    loaders = [dl for dl in dataloaders if dl is not None]
+    if not loaders:
+        raise ValueError("No dataloaders provided.")
+
+    # 1 ▸ tokenizer / model_max_length consistency
+    ref_tok = loaders[0].tokenizer
+    for i, dl in enumerate(loaders[1:], 1):
+        tok = dl.tokenizer
+        if tok.name_or_path   != ref_tok.name_or_path \
+        or tok.vocab_size     != ref_tok.vocab_size \
+        or tok.model_max_length != ref_tok.model_max_length:
+            raise ValueError(f"Tokenizer mismatch between loader[0] and loader[{i}].")
+
+    # 2 ▸ wrap check (filename-only, no data access)
+    inferred = _infer_wrap_from_filename(loaders[0])
+    if inferred is not None and inferred != config.data.wrap:
+        raise ValueError(f"Config says wrap={config.data.wrap} but cache looks "
+                         f"{'wrapped' if inferred else 'unwrapped'}.")
+
+    # 3 ▸ simple batch-size sanity
+    if getattr(config.loader, "batch_size", 1) <= 0:
+        raise ValueError("Batch size must be positive.")
+
+    return {
+        "wrap"          : inferred if inferred is not None else "unknown",
+        "tokenizer"     : ref_tok.name_or_path,
+        "model_max_len" : ref_tok.model_max_length,
+    }
 
 
 def get_logger(name=__name__, level=logging.INFO) -> logging.Logger:
@@ -228,3 +298,61 @@ class GaussianSampler:
     mu = x[:, :n]
     sigma = self.softplus(x[:, n:]).sqrt()
     return mu + sigma * torch.randn_like(mu)
+
+
+
+@lightning.pytorch.utilities.rank_zero_only
+def print_num_parameters(model: torch.nn.Module, verbose: bool = True, print_prefix="") -> None:
+    """
+    Prints the total and trainable number of parameters in a model.
+
+    Args:
+        model: the torch.nn.Module whose parameters to count.
+        verbose: if True, prints the counts; otherwise returns nothing.
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    if verbose:
+        print(f"{print_prefix}Total parameters: {total_params:,}")
+        print(f"{print_prefix}Trainable parameters: {trainable_params:,}")
+
+
+def build_or_load(model_cls, init_kwargs, ckpt_path=None, freeze=False):
+    if ckpt_path and os.path.exists(ckpt_path):
+        model = model_cls.load_from_checkpoint(ckpt_path, **init_kwargs)
+        loaded = True
+    else:
+        model = model_cls(**init_kwargs)
+        loaded = False
+
+    # --- make sure the checkpoint really is the right kind of model -----------
+    if loaded and not isinstance(model, model_cls):
+        raise TypeError(
+            f"Checkpoint at '{ckpt_path}' contains a "
+            f"{type(model).__name__}; expected {model_cls.__name__}"
+        )
+
+
+    return model, loaded
+
+
+
+    # --- helper: clone callbacks and route checkpoints ----------
+import copy
+
+def _callbacks_for(subdir: str, checkpoint_save_dir:str, callbacks):
+        """Return a deep‑copied callbacks list whose ModelCheckpoint
+        saves to .../<subdir>/checkpoints/.
+        #config.checkpointing.save_dir
+        """
+        cbs = []
+        for cb in callbacks:
+            cb_new = copy.deepcopy(cb)
+            if isinstance(cb_new, lightning.pytorch.callbacks.ModelCheckpoint):
+                cb_new.dirpath = os.path.join(checkpoint_save_dir
+                    , subdir, "checkpoints"
+                )
+            cbs.append(cb_new)
+        return cbs
+

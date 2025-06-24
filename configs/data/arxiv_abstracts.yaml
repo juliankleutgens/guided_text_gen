@@ -1,0 +1,8 @@
+train: arxiv_abstracts
+valid: arxiv_abstracts
+tokenizer_name_or_path: bert-base-uncased # gpt2
+cache_dir: ~/hf_datasets_cache
+wrap: True
+streaming: False
+src_domain: stat #physics,cs,math,stat,quant-ph,hep-th,hep-ex,hep-lat,hep-ph,hep-phys
+tgt_domain: quant-ph #physics,cs,math,stat,quant-ph,hep-th,hep-ex,hep-lat,hep-ph,hep-phys

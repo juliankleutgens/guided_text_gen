@@ -1,6 +1,8 @@
 train: scientific_papers_arxiv
 valid: scientific_papers_arxiv
-tokenizer_name_or_path: gpt2
-cache_dir: /share/kuleshov/ssahoo/textdiffusion/data
+tokenizer_name_or_path: bert-base-uncased # gpt2
+cache_dir: ~/hf_datasets_cache
 wrap: True
 streaming: False
+src_domain: None #physics,cs,math,stat,quant-ph,hep-th,hep-ex,hep-lat,hep-ph,hep-phys
+tgt_domain: None #physics,cs,math,stat,quant-ph,hep-th,hep-ex,hep-lat,hep-ph,hep-phys

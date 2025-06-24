@@ -6,43 +6,58 @@ defaults:
   - /strategy: ddp
   - /noise: loglinear
   - /lr_scheduler: constant_warmup
+  - /classifier_model: tiny-classifier # small / tiny
+  - /ratio_model: tiny-ratio # small / tiny
+  - /guidance: null
 
-mode: train  # train / ppl_eval / sample_eval
-diffusion: absorbing_state
+mode: train  # train / ppl_eval / sample_eval / train_ratio
+diffusion: absorbing_state # ?
 backbone: dit  # dit / dimamba / ar
+classifier_backbone: dit  # dit / dimamba / ar
+ratio_backbone: dit
 parameterization: subs  # subs / d3pm / sedd
-time_conditioning: False
+time_conditioning: False # If true noise scale σₜ is passed into your backbone. False: it helps for caching
 T: 0  # 0 (continuous time) / 1000 
-subs_masking: False
+subs_masking: False # True (mask‐only): simpler corruption (MLDM) / False (full substitution, all tokens): more complex corruption (D3PM)
 
 seed: 1
 
 loader:
-  global_batch_size: 512
+  global_batch_size: 64
   eval_global_batch_size: ${.global_batch_size}
   # Note: batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
   pin_memory: True
+  persistent_workers: True
 
 sampling:
   predictor: ddpm_cache  # analytic, ddpm, ddpm_cache
   steps: 128
   noise_removal: True
-  # TODO(yair): @subham, why aren't these params under `eval`?
   num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
   num_sample_log: 2
   semi_ar: False
   stride_length: 1
   num_strides: 1
 
-training:
+training: &base_training
   ema: 0.9999
   antithetic_sampling: True
   importance_sampling: False
   sampling_eps: 1e-3
-  change_of_variables: False
+  change_of_variables: False # switch in different noisy metric
+
+training_classifier:
+  <<: *base_training
+  use_label_smoothing: True
+
+training_ratio:
+  <<: *base_training
+  eta1: 0.1 # the cycle regularization is used
+  eta2: 0.0 # the consistency regularization is used
+  classifier_output_with_sigmoid: false
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
@@ -60,20 +75,45 @@ optim:
   beta2: 0.999
   eps: 1e-8
 
-trainer:
+# trainer is passed wholesale to PyTorch Lightning’s Trainer
+trainer: &base_trainer
   _target_: lightning.Trainer
   accelerator: cpu
   num_nodes: 1
   devices: ${device_count:}
   accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   gradient_clip_val: 1.0
-  precision: 'bf16'
-  num_sanity_val_steps: 2
-  max_steps: 1_000_000
+  precision: '32' #'bf16'
+  num_sanity_val_steps: 1 #2
+  max_steps: 20 #1_000_000
   log_every_n_steps: 10
   limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
   limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
-  val_check_interval: 10000
+  val_check_interval: 1.0  # validate every epoch
+
+classifier_ti:
+  ckpt_path: ""         # leave blank to train from scratch
+  retrain_when_loaded: false   # set false to freeze training if loaded
+
+classifier_td:
+  ckpt_path: ""
+  retrain_when_loaded: false  # just use it, don't train
+
+ratio_model:
+  ckpt_path: ""         # no pre-trained ratio -> will train
+  retrain_when_loaded: true
+
+trainer_ti:                            # TI classifier trainer
+  <<: *base_trainer
+  max_steps: 20
+
+trainer_td:                            # TD classifier trainer
+  <<: *base_trainer
+  max_steps: 20
+
+trainer_ratio:                         # ratio model trainer
+  <<: *base_trainer
+  max_steps: 50_000
 
 wandb:
   project: text-diffusion

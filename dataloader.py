@@ -17,6 +17,7 @@ import torch
 import transformers
 
 import utils
+from utils import filter_arxiv_dataset_by_domain
 
 LOGGER = utils.get_logger(__name__)
 
@@ -102,62 +103,6 @@ def scientific_papers_detokenizer(x):
   x = lm1b_detokenizer(x)
   return x
 
-
-class Text8Tokenizer(transformers.PreTrainedTokenizer):
-  def __init__(
-    self,
-    bos_token='[BOS]',
-    eos_token='[EOS]',
-    sep_token='[SEP]',
-    cls_token='[CLS]',
-    pad_token='[PAD]',
-    mask_token='[MASK]',
-    unk_token='[UNK]',
-    **kwargs):
-    self.characters = list('abcdefghijklmnopqrstuvwxyz ')
-    self._vocab_str_to_int = {
-      '[CLS]': 0,
-      '[SEP]': 1,
-      '[BOS]': 2,
-      '[EOS]': 3,
-      '[MASK]': 4,
-      '[PAD]': 5,
-      '[RESERVED]': 6,
-      '[UNK]': 7,
-      ** {ch: i + 8 for i, ch in enumerate(self.characters)}}
-    self._vocab_int_to_str = {
-      v: k for k, v in self._vocab_str_to_int.items()}
-    super().__init__(
-      bos_token=bos_token,
-      eos_token=eos_token,
-      sep_token=sep_token,
-      cls_token=cls_token,
-      pad_token=pad_token,
-      mask_token=mask_token,
-      unk_token=unk_token,
-      **kwargs)
-
-  @property
-  def vocab_size(self) -> int:
-    return len(self._vocab_str_to_int)
-
-  def _tokenize(self, text: str, **kwargs) -> typing.List[str]:
-    return list(text.lower())
-
-  def _convert_token_to_id(self, token: str) -> int:
-    return self._vocab_str_to_int.get(
-      token, self._vocab_str_to_int['[UNK]'])
-
-  def _convert_id_to_token(self, index: int) -> str:
-    return self._vocab_int_to_str[index]
-
-  def convert_tokens_to_string(self, tokens):
-    return ''.join(tokens)
-
-  def get_vocab(self) -> typing.Dict[str, int]:
-    return self._vocab_str_to_int
-
-
 def get_lambada_test_dataset():
     url = "https://openaipublic.blob.core.windows.net/gpt-2/data/lambada_test.jsonl"
 
@@ -176,102 +121,6 @@ def get_lambada_test_dataset():
     lambada_data = read_jsonl_to_list(url)
     dataset = datasets.Dataset.from_list(lambada_data)
     return dataset
-
-def get_text8_dataset(cache_dir, max_seq_length=256,
-                      drop_last=True, crop_train=False):
-  """Adapted from:
-    https://github.com/google-research/google-research/blob/master/d3pm/text/datasets.py#L344
-
-    Args:
-      cache_dir: str, path to cache directory.
-      max_seq_length: int, maximum length of sequences.
-          (default: 256, as in D3PM codebase.)
-      drop_last: bool, whether to drop the last incomplete
-          batch. (default: True, as in D3PM codebase.)
-      crop_train: bool, whether to subsample contiguous
-          subsequences from training example. serves to
-          make sure transformer models with absolute position
-          embeddings do not have incorrect position-wise
-          marginals. (default: False, but necessary to match D3PM AR)
-
-    Returns:
-      dataset: dataset.DatasetDict, with keys 'train',
-          'valid', 'test'.
-  """
-  url = 'http://mattmahoney.net/dc/text8.zip'
-  if not crop_train:
-    cache_dir = f'{cache_dir}/text8'
-  else:
-    cache_dir = f'{cache_dir}/text8-crop-train'
-  split_names = ['train', 'validation', 'test']
-  if not all([
-    utils.fsspec_exists(os.path.join(cache_dir, split))
-    for split in split_names
-  ]):
-    # Check if raw data exists
-    raw_cache_dir = os.path.join(cache_dir, 'raw_data')
-    if not all([
-      utils.fsspec_exists(
-        os.path.join(raw_cache_dir, f'text8.{split}.txt'))
-      for split in split_names
-    ]):
-      if not utils.fsspec_exists(
-        os.path.join(raw_cache_dir, 'text8.zip')):
-        utils.fsspec_mkdirs(raw_cache_dir, exist_ok=True)
-        LOGGER.info('Downloading text8 from URL {}.'.format(url))
-        with (urllib.request.urlopen(url) as in_stream,
-              open(os.path.join(raw_cache_dir, 'text8.zip'),
-                   'wb') as out_file):
-          shutil.copyfileobj(in_stream, out_file)
-
-      with fsspec.open(
-        os.path.join(raw_cache_dir, 'text8.zip'),
-        'rb') as f:
-        rawdata = zipfile.ZipFile(f).read(
-          'text8').decode('utf-8')
-
-      # Splits taken from D3PM codebase
-      splits = {
-        'train': rawdata[:90000000],
-        'validation': rawdata[90000000: 95000000],
-        'test': rawdata[95000000:],
-      }
-
-      for split, data in splits.items():
-        _path = os.path.join(raw_cache_dir,
-                             f'text8.{split}.txt')
-        with fsspec.open(_path, 'w') as f:
-          f.write(data)
-    else:
-      splits = {}
-      for split in split_names:
-        _path = os.path.join(raw_cache_dir,
-                             f'text8.{split}.txt')
-        with fsspec.open(_path, 'r') as f:
-          splits[split] = f.read()
-
-    # Chunk and save as datasets.DatasetDict
-    def chunks(lst, n):
-      """Yield successive n-sized chunks from lst."""
-      for i in range(0, len(lst), n):
-        yield lst[i:i + n]
-
-    dataset_dict = {}
-    for k, v in splits.items():
-      if k == 'train' and crop_train == True:
-        chunk_size = 2 * max_seq_length
-      else:
-        chunk_size = max_seq_length
-      text = list(chunks(v, chunk_size))
-      if drop_last and len(text[-1]) < chunk_size:
-        text = text[:-1]
-      dataset_dict[k] = datasets.Dataset.from_dict({'text': text})
-    dataset = datasets.DatasetDict(dataset_dict)
-    dataset.save_to_disk(cache_dir)
-  else:
-    dataset = datasets.load_from_disk(cache_dir)
-
-  return dataset
 
 
 def _group_texts(examples, block_size, bos, eos):
@@ -302,17 +151,21 @@ def _group_texts(examples, block_size, bos, eos):
 
 def get_dataset(
     dataset_name, tokenizer, wrap, mode, cache_dir,
-    block_size=1024, num_proc=None, streaming=False):
+    block_size=1024, num_proc=None, streaming=False, subset_key=None,):
   if num_proc is None:
     try:
       num_proc = len(os.sched_getaffinity(0))
     except AttributeError:
       num_proc = os.cpu_count() or 1
 
-  if wrap:
-    filename = f'{dataset_name}_{mode}_bs{block_size}_wrapped.dat'
-  else:
-    filename = f'{dataset_name}_{mode}_bs{block_size}_unwrapped.dat'
+  # -- 1 ▸ Check if the dataset is already cached and tokenized --
+  tok_tag = re.sub(r"[^a-zA-Z0-9]+", "-",  # make it filename-safe
+                   tokenizer.name_or_path.split("/")[-1])
+  filename = f"{dataset_name}"
+  if subset_key is not None:
+    filename += f'_{subset_key}'
+    filename += f"_{mode}_bs{block_size}_{tok_tag}"
+  filename += '_wrapped.dat' if wrap else '_unwrapped.dat'
   _path = os.path.join(cache_dir, filename)
   
   if utils.fsspec_exists(_path):
@@ -320,11 +173,7 @@ def get_dataset(
     return datasets.load_from_disk(_path).with_format('torch')
   LOGGER.info(f'Generating new data at: {_path}')
 
-  crop_train = dataset_name == 'text8-crop'
-  if mode == 'train' and crop_train:
-    # double block size for sub-sampling
-    block_size *= 2
-  
+  # -- 2 ▸ Download the dataset --
   if dataset_name == 'wikitext103':
     dataset = datasets.load_dataset(
       'wikitext',
@@ -335,36 +184,23 @@ def get_dataset(
       'wikitext',
       name='wikitext-2-raw-v1',
       cache_dir=cache_dir)
-  elif dataset_name == 'ptb':
-    dataset = datasets.load_dataset(
-      'ptb_text_only', cache_dir=cache_dir)
   elif dataset_name == 'lambada':
     dataset = get_lambada_test_dataset()
-  elif dataset_name == 'text8':
-    assert wrap
-    dataset = get_text8_dataset(
-      cache_dir, max_seq_length=block_size)
-  elif dataset_name == 'text8-crop':
-    dataset = get_text8_dataset(
-      cache_dir, max_seq_length=block_size, crop_train=True)
-  elif dataset_name == 'openwebtext-train':
-    dataset = datasets.load_dataset(
-      'openwebtext',
-      split='train[:-100000]',
-      cache_dir=cache_dir,
-      streaming=streaming)
-  elif dataset_name == 'openwebtext-valid':
-    dataset = datasets.load_dataset(
-      'openwebtext',
-      split='train[-100000:]',
-      cache_dir=cache_dir,
-      streaming=streaming)
   elif dataset_name == 'scientific_papers_arxiv':
     dataset = datasets.load_dataset(
-      'scientific_papers', 'arxiv',
-      trust_remote_code=True,
-      cache_dir=cache_dir,
-      streaming=streaming)
+        'scientific_papers', 'arxiv',
+        trust_remote_code=True,
+        cache_dir=cache_dir,
+        streaming=streaming)
+  elif dataset_name == 'arxiv_abstracts':
+      ds = datasets.load_dataset(
+        "json",
+        data_files="/Users/juliankleutgens/arxiv-metadata-oai-snapshot.json", # https://www.kaggle.com/datasets/Cornell-University/arxiv
+        split="train",
+        streaming=False
+      )
+      dataset_filtered = filter_arxiv_dataset_by_domain(ds, subset_key)
+      dataset = dataset_filtered.train_test_split(test_size=0.1, seed=42)
   elif dataset_name == 'scientific_papers_pubmed':
     dataset = datasets.load_dataset(
       'scientific_papers', 'pubmed',
@@ -382,18 +218,15 @@ def get_dataset(
       cache_dir=cache_dir,
       streaming=streaming)
 
-  if dataset_name in ['lambada', 'openwebtext-train',
-                      'openwebtext-valid']:
+  if (dataset_name in ['lambada']):
     data = dataset
+  elif dataset_name in ['arxiv_abstracts']:
+    data = dataset["train"] if mode == 'train' else dataset["test"]
   else:
     data = dataset[mode]
 
   if dataset_name.startswith('wikitext'):
     detokenizer = wt_detokenizer
-  elif dataset_name == 'ptb':
-    detokenizer = ptb_detokenizer
-  elif dataset_name == 'lm1b':
-    detokenizer = lm1b_detokenizer
   elif dataset_name == 'lambada':
     detokenizer = lambada_detokenizer
   elif dataset_name.startswith('scientific_papers'):
@@ -412,10 +245,10 @@ def get_dataset(
   BOS = tokenizer.encode(tokenizer.bos_token)[0]
 
   def preprocess_and_tokenize(example):
-    if dataset_name == 'ptb':
-      text = example['sentence']
-    elif 'scientific_papers' in dataset_name:
+    if 'scientific_papers' in dataset_name:
       text = example['article']
+    elif 'arxiv_abstracts' in dataset_name:
+      text = example['abstract']
     else:
       text = example['text']
     
@@ -453,20 +286,11 @@ def get_dataset(
       preprocess_and_tokenize,
       batched=True,
       num_proc=num_proc,
+      #batch_size=1000,
       load_from_cache_file=True,
       desc='Tokenizing')
-  if dataset_name == 'ptb':
-    tokenized_dataset = tokenized_dataset.remove_columns(
-      'sentence')
-  elif 'scientific_papers' in dataset_name:
-    tokenized_dataset = tokenized_dataset.remove_columns([
-      'article', 'abstract', 'section_names'])
-  elif dataset_name == 'ag_news':
-    tokenized_dataset = tokenized_dataset.remove_columns(
-      ['text', 'label'])
-  else:
-    tokenized_dataset = tokenized_dataset.remove_columns(
-      'text')
+
+  tokenized_dataset = tokenized_dataset.select_columns("input_ids")
 
   if not wrap:
     tokenized_dataset.save_to_disk(_path)
@@ -492,9 +316,7 @@ def get_dataset(
 
 
 def get_tokenizer(config):
-  if config.data.tokenizer_name_or_path == 'text8':
-    tokenizer = Text8Tokenizer()
-  elif config.data.tokenizer_name_or_path == 'bert-base-uncased':
+  if config.data.tokenizer_name_or_path == 'bert-base-uncased':
     tokenizer = transformers.BertTokenizer.\
       from_pretrained('bert-base-uncased')
   else:
@@ -526,26 +348,40 @@ def get_tokenizer(config):
     tokenizer.add_special_tokens({'pad_token': '[PAD]'})
 
   return tokenizer
-    
+
+def check_batch_size_for_gpu(config):
+    num_gpus = torch.cuda.device_count()
+    assert (config.loader.global_batch_size
+            == (config.loader.batch_size
+                * config.trainer.num_nodes
+                * num_gpus
+                * config.trainer.accumulate_grad_batches))
+    if config.loader.global_batch_size % (
+      num_gpus * config.trainer.accumulate_grad_batches) != 0:
+      raise ValueError(
+        f'Train Batch Size {config.training.batch_size}'
+        f'not divisible by {num_gpus} gpus with accumulation '
+        f'{config.trainer.accumulate_grad_batches}.')
+    if config.loader.eval_global_batch_size % num_gpus != 0:
+      raise ValueError(
+        f'Eval Batch Size for {config.eval.batch_size} '
+        f'not divisible by {num_gpus}.')
 
 def get_dataloaders(config, tokenizer, skip_train=False,
-                    skip_valid=False, valid_seed=None):
-  num_gpus = torch.cuda.device_count()
-  assert (config.loader.global_batch_size
-          == (config.loader.batch_size
-              * config.trainer.num_nodes
-              * num_gpus
-              * config.trainer.accumulate_grad_batches))
-  if config.loader.global_batch_size % (
-    num_gpus * config.trainer.accumulate_grad_batches) != 0:
-    raise ValueError(
-      f'Train Batch Size {config.training.batch_size}'
-      f'not divisible by {num_gpus} gpus with accumulation '
-      f'{config.trainer.accumulate_grad_batches}.')
-  if config.loader.eval_global_batch_size % num_gpus != 0:
-    raise ValueError(
-      f'Eval Batch Size for {config.eval.batch_size} '
-      f'not divisible by {num_gpus}.')
+                    skip_valid=False, valid_seed=None,
+                    domain=None):
+  # -- 1 ▸ Check if the batch sizes are correct --
+  if torch.cuda.is_available():
+    check_batch_size_for_gpu(config)
+
+  # chose the correct subset of dataset for target and source domain
+  if domain:
+    raw = config.data.get(f"{domain}_domain", None)
+    subset_key = raw if raw and raw.lower() != "none" else None
+  else:
+    subset_key = None
+
+  # -- 2 ▸ Get the train and validation datasets --
   if skip_train:
     train_set = None
   else:
@@ -555,9 +391,10 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode='train',
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
-      block_size=config.model.length)
+      block_size=config.model.length,
+      subset_key=subset_key)
   
-  if config.data.valid in ['text8', 'lm1b', 'ag_news']:
+  if config.data.valid in ['text8', 'lm1b', 'ag_news', 'arxiv_abstracts']:
     validation_split = 'test'
   else:
     validation_split = 'validation'
@@ -571,11 +408,16 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode=validation_split,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
-      streaming=False)
+      streaming=False,
+      subset_key=subset_key)
 
+  # -- 3 ▸ Create the train and validation dataloaders --
   if skip_train:
     train_loader = None
   else:
+    if config.trainer.accelerator == 'cpu':
+      from torch.utils.data import Subset
+      train_set = Subset(train_set, indices=list(range(200)))
     train_loader = torch.utils.data.DataLoader(
       train_set,
       batch_size=config.loader.batch_size,
@@ -584,6 +426,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       shuffle=not config.data.streaming,
       persistent_workers=True)
     train_loader.tokenizer = tokenizer
+
   if skip_valid:
     valid_loader = None
   else:
@@ -593,6 +436,9 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     else:
       shuffle_valid = True
       generator = torch.Generator().manual_seed(valid_seed)
+    if config.trainer.accelerator == 'cpu':
+        from torch.utils.data import Subset
+        valid_set = Subset(valid_set, indices=list(range(200)))
     valid_loader = torch.utils.data.DataLoader(
       valid_set,
       batch_size=config.loader.eval_batch_size,
@@ -710,3 +556,89 @@ class FaultTolerantDistributedSampler(torch.utils.data.DistributedSampler):
       yield index
 
     self.counter = 0
+
+
+
+# ---------- 1. single mixed stream -------------------------------------------
+from itertools import cycle
+from torch.utils.data import ConcatDataset, DataLoader
+
+
+class DomainLabeledDataset(torch.utils.data.Dataset):
+    """Adds a constant domain label to every sample of `base_ds`."""
+    def __init__(self, base_ds, label: int):
+        self.base_ds = base_ds
+        self.label   = label            # 1 = src, 0 = tgt
+
+    def __len__(self):
+        return len(self.base_ds)
+
+    def __getitem__(self, idx):
+        item = dict(self.base_ds[idx])  # shallow copy
+        item["label"] = self.label
+        return item
+
+def build_mixed_loader(src_loader, tgt_loader, cfg):
+    """
+    Concatenate the two datasets, add domain labels (1=src, 0=tgt),
+    and return one shuffled DataLoader.
+    """
+
+    mixed_ds = ConcatDataset([
+        DomainLabeledDataset(src_loader.dataset, 1),
+        DomainLabeledDataset(tgt_loader.dataset, 0)
+    ])
+    return DataLoader(
+        mixed_ds,
+        batch_size=cfg.loader.batch_size,
+        shuffle=True,
+        num_workers=cfg.loader.num_workers,
+        pin_memory=cfg.loader.pin_memory,
+        persistent_workers=src_loader.persistent_workers,
+        collate_fn=src_loader.collate_fn,  # keep the same tokenizer collator
+    )
+
+# ---------- 2. paired iterator (src-batch , tgt-batch) ------------------------
+
+class PairedDomainLoader:
+    """
+    At every step returns a single dict that merges a *source* and a *target*
+    batch.  Keys are suffixed with `_src` and `_tgt` so they stay unique.
+    The longer loader defines the epoch length; the shorter one is cycled.
+    """
+
+    def __init__(self, src_loader, tgt_loader):
+        # decide which loader is longer
+        if len(src_loader) >= len(tgt_loader):
+            self.long_loader, self.short_loader = src_loader, tgt_loader
+            self.order = ("src", "tgt")
+        else:
+            self.long_loader, self.short_loader = tgt_loader, src_loader
+            self.order = ("tgt", "src")
+
+        # expose attributes so Lightning callbacks behave normally
+        self.dataset   = self.long_loader.dataset
+        self.sampler   = self.long_loader.sampler
+        self.tokenizer = getattr(self.long_loader.dataset, "tokenizer", None)
+
+    def __iter__(self):
+        short_iter = cycle(self.short_loader)
+        for long_batch in self.long_loader:
+            short_batch = next(short_iter)
+
+            # restore original (src, tgt) order
+            src_batch, tgt_batch = (
+                (long_batch, short_batch)
+                if self.order == ("src", "tgt")
+                else
+                (short_batch, long_batch)
+            )
+
+            merged = {f"{k}_src": v for k, v in src_batch.items()}
+            merged.update({f"{k}_tgt": v for k, v in tgt_batch.items()})
+            yield merged
+
+    def __len__(self):
+        return len(self.long_loader)
+
+

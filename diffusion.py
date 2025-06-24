@@ -66,6 +66,9 @@ class Perplexity(NLL):
 
 
 class Diffusion(L.LightningModule):
+  # ==========================================
+  # 0. Initialization
+  # ==========================================
   def __init__(
     self,
     config,
@@ -97,11 +100,6 @@ class Diffusion(L.LightningModule):
         self.config,
         vocab_size=self.vocab_size,
         pad_token_id=self.tokenizer.pad_token_id)
-    elif self.config.backbone == 'ar':
-      self.backbone = models.autoregressive.AR(
-        self.config,
-        vocab_size=self.vocab_size,
-        mask_index=self.mask_index)
     elif self.config.backbone == 'hf_dit':
       self.backbone = transformers.AutoModelForMaskedLM.from_pretrained(
         config.eval.checkpoint_path, trust_remote_code=True)
@@ -152,6 +150,9 @@ class Diffusion(L.LightningModule):
     self.fast_forward_batches = None
     self._validate_configuration()
 
+  # ==========================================
+  # 1. Configuration validation and checkpointing
+  # ==========================================
   def _validate_configuration(self):
     assert not (self.change_of_variables
                 and self.importance_sampling)
@@ -214,7 +215,11 @@ class Diffusion(L.LightningModule):
     else:
       checkpoint['sampler']['random_state'] = None
 
+  # ==========================================
+  # 2. Training and validation hooks
+  # ==========================================
   def on_train_start(self):
+    """Hook called at the beginning of training."""
     if self.ema:
       self.ema.move_shadow_params_to_device(self.device)
     # Adapted from:
@@ -252,12 +257,17 @@ class Diffusion(L.LightningModule):
     self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
   def optimizer_step(self, *args, **kwargs):
+    """The optimizer step for the Hydra."""
     super().optimizer_step(*args, **kwargs)
     if self.ema:
       self.ema.update(itertools.chain(
         self.backbone.parameters(),
         self.noise.parameters()))
 
+  # ==========================================
+  # 3. Loss computation and parameterization for three types
+  #    of parameterization: subs, d3pm, sedd
+  # ==========================================
   def _subs_parameterization(self, logits, xt):
     # log prob at the mask index = - infinity
     logits[:, :, self.mask_index] += self.neg_infinity
@@ -322,6 +332,9 @@ class Diffusion(L.LightningModule):
       return self._d3pm_parameterization(logits=logits)
     return logits
 
+  # ==========================================
+  # 4. Loss computation
+  # ==========================================
   def _d3pm_loss(self, model_output, xt, x0, t):
     dt = 1 / self.T
 
@@ -416,7 +429,7 @@ class Diffusion(L.LightningModule):
       # TODO(justin): implement sampling and kv cache for AR
       samples, text_samples = None, None
       for _ in range(
-        self.config.sampling.num_sample_batches):
+        1):#self.config.sampling.num_sample_batches):
         samples = self._sample()
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
@@ -654,11 +667,9 @@ class Diffusion(L.LightningModule):
   def _sample(self, num_steps=None, eps=1e-5):
     """Generate samples from the model."""
     batch_size_per_gpu = self.config.loader.eval_batch_size
-    if self.parameterization == 'ar':
-      return self._ar_sampler(batch_size_per_gpu)
     # Lightning auto-casting is not working in this method for some reason
     if num_steps is None:
-      num_steps = self.config.sampling.steps
+      num_steps =  3 # self.config.sampling.steps
     x = self._sample_prior(
       batch_size_per_gpu,
       self.config.model.length).to(self.device)
@@ -668,6 +679,7 @@ class Diffusion(L.LightningModule):
     p_x0_cache = None
 
     for i in range(num_steps):
+      print(i)
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm_cache':
@@ -681,6 +693,7 @@ class Diffusion(L.LightningModule):
       else:
         x = self._analytic_update(x, t, dt)
 
+    # just one last denoising step to get rid of remaining MASK tokens
     if self.config.sampling.noise_removal:
       t = timesteps[-1] * torch.ones(x.shape[0], 1,
                                      device=self.device)
