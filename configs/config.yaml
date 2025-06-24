@@ -11,12 +11,12 @@ defaults:
   - /guidance: null
 
 mode: train  # train / ppl_eval / sample_eval / train_ratio
-diffusion: absorbing_state # ?
+diffusion: absorbing_state # absorbing_state / uniform
 backbone: dit  # dit / dimamba / ar
 classifier_backbone: dit  # dit / dimamba / ar
 ratio_backbone: dit
 parameterization: subs  # subs / d3pm / sedd
-time_conditioning: False # If true noise scale σₜ is passed into your backbone. False: it helps for caching
+time_conditioning: True # If true noise scale σₜ is passed into your backbone. False: it helps for caching
 T: 0  # 0 (continuous time) / 1000 
 subs_masking: False # True (mask‐only): simpler corruption (MLDM) / False (full substitution, all tokens): more complex corruption (D3PM)
 
@@ -92,11 +92,11 @@ trainer: &base_trainer
   val_check_interval: 1.0  # validate every epoch
 
 classifier_ti:
-  ckpt_path: ""         # leave blank to train from scratch
-  retrain_when_loaded: false   # set false to freeze training if loaded
+  ckpt_path: "/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/ti_classifier/checkpoints/best.ckpt"         # leave blank to train from scratch
+  retrain_when_loaded: false   # just use it, don't train
 
 classifier_td:
-  ckpt_path: ""
+  ckpt_path: "/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/td_classifier/checkpoints/best.ckpt"
   retrain_when_loaded: false  # just use it, don't train
 
 ratio_model:
@@ -112,8 +112,9 @@ trainer_td:                            # TD classifier trainer
   max_steps: 20
 
 trainer_ratio:                         # ratio model trainer
+  # ToDo: Why does ratio training take so much longer?
   <<: *base_trainer
-  max_steps: 50_000
+  max_steps: 5
 
 wandb:
   project: text-diffusion

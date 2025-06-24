@@ -537,7 +537,7 @@ class DITClassifier(nn.Module):
 
 
 class DITRatio(nn.Module):
-  def __init__(self, config, vocab_size, time_conditioning=False):
+  def __init__(self, config, vocab_size, time_conditioning=True):
     super().__init__()
     if type(config) == dict:
       config = omegaconf.OmegaConf.create(config)
@@ -572,7 +572,7 @@ class DITRatio(nn.Module):
     self.pooling = getattr(config.ratio_model, 'pooling', 'mean')
     self.output_layer = nn.Linear(
       config.ratio_model.hidden_size,
-      config.ratio_model.num_classes)
+      1)
 
   def _get_bias_dropout_scale(self):
     if self.training:

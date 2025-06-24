@@ -645,23 +645,6 @@ class Diffusion(L.LightningModule):
     copy_flag = (x != self.mask_index).to(x.dtype)
     return copy_flag * x + (1 - copy_flag) * _x
 
-  def _ar_sampler(self, bsz):
-    # precompute token buffer
-    num_pred_tokens = self.config.model.length - 1
-    x = torch.zeros(
-      (bsz, num_pred_tokens + 1),
-      dtype=torch.long,
-      device=self.device)
-    x[:, 0] = self.tokenizer.bos_token_id
-    # precompute noise
-    noise = (torch.distributions.Gumbel(0, 1)
-             .sample((bsz, num_pred_tokens, self.vocab_size))
-             .to(self.device))
-    for i in range(num_pred_tokens):
-      next_logits = self.forward(x[:, :i + 1], None)[:, -1]
-      y = (next_logits + noise[:, i]).argmax(-1)
-      x[:, i + 1] = y
-    return x
 
   @torch.no_grad()
   def _sample(self, num_steps=None, eps=1e-5):

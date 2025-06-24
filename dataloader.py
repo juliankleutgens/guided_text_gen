@@ -622,8 +622,18 @@ class PairedDomainLoader:
         self.tokenizer = getattr(self.long_loader.dataset, "tokenizer", None)
 
     def __iter__(self):
-        short_iter = cycle(self.short_loader)
-        for long_batch in self.long_loader:
+        """
+        Create *fresh* iterators for both underlying loaders every time Lightning
+        (re‑)starts an epoch.
+
+        * `long_loader` is iterated exactly once.
+        * `short_loader` is wrapped in `itertools.cycle` so that it is repeated
+          indefinitely and never exhausts.
+        """
+        long_iter  = iter(self.long_loader)          # new iterator each call
+        short_iter = cycle(iter(self.short_loader))  # idem, but endless
+
+        for long_batch in long_iter:
             short_batch = next(short_iter)
 
             # restore original (src, tgt) order

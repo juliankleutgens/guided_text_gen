@@ -341,18 +341,22 @@ def build_or_load(model_cls, init_kwargs, ckpt_path=None, freeze=False):
     # --- helper: clone callbacks and route checkpoints ----------
 import copy
 
-def _callbacks_for(subdir: str, checkpoint_save_dir:str, callbacks):
-        """Return a deep‑copied callbacks list whose ModelCheckpoint
-        saves to .../<subdir>/checkpoints/.
-        #config.checkpointing.save_dir
-        """
-        cbs = []
-        for cb in callbacks:
-            cb_new = copy.deepcopy(cb)
-            if isinstance(cb_new, lightning.pytorch.callbacks.ModelCheckpoint):
-                cb_new.dirpath = os.path.join(checkpoint_save_dir
-                    , subdir, "checkpoints"
-                )
-            cbs.append(cb_new)
-        return cbs
+def _callbacks_for(subdir: str, checkpoint_save_dir: str, callbacks):
+    """Return a deep‑copied callbacks list whose ModelCheckpoint
+    saves to .../<subdir>/checkpoints/.
+    #config.checkpointing.save_dir
+    """
+    cbs = []
+    for cb in callbacks:
+        cb_new = copy.deepcopy(cb)
+        if isinstance(cb_new, lightning.pytorch.callbacks.ModelCheckpoint):
+            cb_new.dirpath = os.path.join(
+                checkpoint_save_dir, subdir, "checkpoints"
+            )
+            # Special‑case: for the ratio model we want to track a different metric
+            # ToDo: this is a hack, should be fixed in the config make a new config for ratio model
+            if subdir == 'ratio_model' and getattr(cb_new, 'monitor', None) == 'val/cross_entropy':
+                cb_new.monitor = 'val/total'  # RatioEstimator logs val/total, not val/cross_entropy
+        cbs.append(cb_new)
+    return cbs
 

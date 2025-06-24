@@ -12,7 +12,7 @@ import dataloader
 import models.dit
 import noise_schedule
 import utils
-
+from base_dm_model import BaseDMModel
 
 class MicroAveragingMetric(torchmetrics.Metric):
   """Micro-averaging metric.
@@ -139,156 +139,87 @@ class Recall(MicroAveragingMetric):
     return numerator, denominator
 
 
-class Classifier(L.LightningModule):
+class Classifier(BaseDMModel):
   def __init__(
-      self,
-      config,
-      tokenizer: transformers.PreTrainedTokenizer,
-      pretrained_backbone: typing.Optional[torch.nn.Module] = None,
-      train_time_independent=False):
-    super().__init__()
-    self.save_hyperparameters(ignore=['pretrained_backbone'])
-    self.config = config
-    self.train_time_independent = train_time_independent
+        self,
+        config,
+        tokenizer: transformers.PreTrainedTokenizer,
+        pretrained_backbone: typing.Optional[torch.nn.Module] = None,
+        train_time_independent: bool = False,
+    ):
+      # --------------------------------------------------
+      # 0 ▸ Minimal attributes required by BaseDMModel
+      self.config = config
+      super().__init__()  # <- gives us self.dtype
 
-    # This param indicates whether this model will be used
-    #  for guidance (False) or only evaluation (True).
-    self.is_eval_classifier = getattr(
-      config, 'is_eval_classifier', False)
+      # --------------------------------------------------
+      # 1 ▸ High‑level flags
+      self.train_time_independent = train_time_independent
+      self.is_eval_classifier = getattr(config, "is_eval_classifier", False)
 
-    self.tokenizer = tokenizer
-    self.vocab_size = tokenizer.vocab_size
-    self.antithetic_sampling = config.training_classifier.antithetic_sampling
-    self.importance_sampling = config.training_classifier.importance_sampling
-    self.change_of_variables = config.training_classifier.change_of_variables
-    if (not hasattr(self.tokenizer, 'mask_token')
-        or self.tokenizer.mask_token is None):
-      self.mask_index = self.vocab_size
-      self.vocab_size += 1
-    else:
-      self.mask_index = self.tokenizer.mask_token_id
-
-    if config.classifier_backbone == 'dit':
-      self.classifier_model = models.dit.DITClassifier(
-        self.config, vocab_size=self.vocab_size, time_conditioning=not train_time_independent)
-    elif self.config.classifier_backbone == 'dimamba':
-      self.classifier_model = models.dimamba.DiMambaClassifier(
-        self.config, vocab_size=self.vocab_size,
-        pad_token_id=self.tokenizer.pad_token_id)
-    else:
-      raise NotImplementedError(
-        f"Classifier backbone "
-        f"{self.config.classifier_backbone} not "
-        f"implemented.")
-    if pretrained_backbone is not None:  # For PPLM / NOS
-      self.classifier_model.load_pretrained_encoder(
-        pretrained_backbone)
-    utils.print_num_parameters(self.classifier_model, print_prefix='Classifier model ')
-    # Metrics are automatically reset at end of epoch
-    metrics = torchmetrics.MetricCollection({
-      'cross_entropy': CrossEntropy(),
-      'accuracy': Accuracy(class_idx=None),
-      'precision': Precision(class_idx=1),
-      'recall': Recall(class_idx=1)
-    })
-
-    metrics.set_dtype(torch.float64)
-    self.train_metrics = metrics.clone(prefix='train/')
-    self.valid_metrics = metrics.clone(prefix='val/')
-
-    self.T = config.T
-    self.noise = noise_schedule.get_noise(config,
-                                          dtype=self.dtype)
-    self.sampling_eps = config.training_classifier.sampling_eps
-    self.lr = config.optim.lr
-    self.time_conditioning = config.time_conditioning
-    self.fast_forward_epochs = None
-    self.fast_forward_batches = None
-
-  def on_load_checkpoint(self, checkpoint):
-    # Copied from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
-    self.fast_forward_epochs = checkpoint['loops'][
-      'fit_loop']['epoch_progress']['current']['completed']
-    self.fast_forward_batches = checkpoint['loops'][
-      'fit_loop']['epoch_loop.batch_progress'][
-      'current']['completed']
-
-  def on_save_checkpoint(self, checkpoint):
-    # Copied from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
-    # ['epoch_loop.batch_progress']['total']['completed'] is
-    #  1 iteration behind, so we're using the optimizer's
-    #  progress.
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.batch_progress']['total'][
-      'completed'] = checkpoint['loops']['fit_loop'][
-                       'epoch_loop.automatic_optimization.optim_progress'][
-                       'optimizer']['step']['total'][
-                       'completed'] * self.trainer.accumulate_grad_batches
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.batch_progress']['current'][
-      'completed'] = checkpoint['loops']['fit_loop'][
-                       'epoch_loop.automatic_optimization.optim_progress'][
-                       'optimizer']['step']['current'][
-                       'completed'] * self.trainer.accumulate_grad_batches
-    # _batches_that_stepped tracks the number of global
-    # steps, not the number of local steps, so we don't
-    # multiply with self.trainer.accumulate_grad_batches
-    # here.
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.state_dict'][
-      '_batches_that_stepped'] = \
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.automatic_optimization.optim_progress'][
-      'optimizer']['step']['total']['completed']
-    if 'sampler' not in checkpoint.keys():
-      checkpoint['sampler'] = {}
-    if hasattr(self.trainer.train_dataloader.sampler,
-               'state_dict'):
-      sampler_state_dict = self.trainer. \
-        train_dataloader.sampler.state_dict()
-      checkpoint['sampler'][
-        'random_state'] = sampler_state_dict.get(
-        'random_state', None)
-    else:
-      checkpoint['sampler']['random_state'] = None
-
-  def on_train_start(self):
-    # Adapted from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
-    distributed = (
-        self.trainer._accelerator_connector.use_distributed_sampler
-        and self.trainer._accelerator_connector.is_distributed)
-    if distributed:
-      sampler_cls = dataloader.FaultTolerantDistributedSampler
-    else:
-      sampler_cls = dataloader.RandomFaultTolerantSampler
-    updated_dls = []
-    for dl in self.trainer.fit_loop._combined_loader.flattened:
-      if hasattr(dl.sampler, 'shuffle'):
-        dl_sampler = sampler_cls(
-          dl.dataset, shuffle=dl.sampler.shuffle)
+      # --------------------------------------------------
+      # 2 ▸ Tokenizer & vocabulary
+      self.tokenizer = tokenizer
+      self.vocab_size = tokenizer.vocab_size
+      if not getattr(tokenizer, "mask_token", None):
+          self.mask_index = self.vocab_size
+          self.vocab_size += 1
       else:
-        dl_sampler = sampler_cls(dl.dataset)
-      if (distributed
-          and self.fast_forward_epochs is not None
-          and self.fast_forward_batches is not None):
-        dl_sampler.load_state_dict({
-          'epoch': self.fast_forward_epochs,
-          'counter': (self.fast_forward_batches
-                      * self.config.loader.batch_size)})
-      updated_dls.append(
-        torch.utils.data.DataLoader(
-          dl.dataset,
-          batch_size=self.config.loader.batch_size,
-          num_workers=self.config.loader.num_workers,
-          pin_memory=self.config.loader.pin_memory,
-          sampler=dl_sampler,
-          shuffle=False,
-          persistent_workers=self.config.loader.persistent_workers
-        ))
-    self.trainer.fit_loop._combined_loader.flattened = updated_dls
+          self.mask_index = tokenizer.mask_token_id
+
+      # --------------------------------------------------
+      # 3 ▸ Training‑schedule hyper‑parameters
+      tr_cfg = config.training_classifier
+      self.antithetic_sampling = tr_cfg.antithetic_sampling
+      self.importance_sampling = tr_cfg.importance_sampling
+      self.change_of_variables = tr_cfg.change_of_variables
+      self.sampling_eps = tr_cfg.sampling_eps
+
+      self.T = config.T
+      self.lr = config.optim.lr
+      self.time_conditioning = config.time_conditioning
+
+      # --------------------------------------------------
+      # 4 ▸ Noise schedule (needs self.dtype from parent)
+      self.noise = noise_schedule.get_noise(config, dtype=self.dtype)
+
+      # --------------------------------------------------
+      # 5 ▸ Backbone construction
+      if config.classifier_backbone == "dit":
+          self.classifier_model = models.dit.DITClassifier(
+              config,
+              vocab_size=self.vocab_size,
+              time_conditioning=not train_time_independent,
+          )
+      else:
+          raise NotImplementedError(
+              f"Classifier backbone {config.classifier_backbone} not implemented."
+          )
+
+      if pretrained_backbone is not None:
+          # For PPLM / NoS fine‑tuning
+          self.classifier_model.load_pretrained_encoder(pretrained_backbone)
+
+      utils.print_num_parameters(self.classifier_model, print_prefix="Classifier model ")
+
+      # --------------------------------------------------
+      # 6 ▸ Metrics
+      metrics = torchmetrics.MetricCollection(
+          {
+              "cross_entropy": CrossEntropy(),
+              "accuracy": Accuracy(class_idx=None),
+              "precision": Precision(class_idx=1),
+              "recall": Recall(class_idx=1),
+          }
+      )
+      metrics.set_dtype(torch.float64)
+      self.train_metrics = metrics.clone(prefix="train/")
+      self.valid_metrics = metrics.clone(prefix="val/")
+
+      # --------------------------------------------------
+      # 7 ▸ Fast‑forward placeholders (set during training)
+      self.fast_forward_epochs = None
+      self.fast_forward_batches = None
 
   def forward(self, x, sigma=None, x_emb=None, attention_mask=None):
     """Returns logits.
@@ -305,19 +236,6 @@ class Classifier(L.LightningModule):
       with torch.cuda.amp.autocast(dtype=torch.float32):
         logits = self.classifier_model(x, sigma, x_emb=x_emb, attention_mask=attention_mask)
     return logits
-
-  def get_log_probs(self, x, sigma, x_emb=None):
-    """Returns log probabilities.
-      Use for CBG-style guidance.
-    """
-    if self.is_eval_classifier:
-      raise NotImplementedError(
-        '`get_log_prob` not implemented for classifiers '
-        'that are meant to be used for evaluation purposes '
-        'only.')
-    with torch.cuda.amp.autocast(dtype=torch.float32):
-      return torch.nn.functional.log_softmax(
-        self.forward(x, sigma, x_emb=x_emb), dim=-1)
 
   def training_step(self, batch, batch_idx):
     loss = self._compute_loss(batch, prefix='train')
@@ -360,46 +278,6 @@ class Classifier(L.LightningModule):
     }
     return [optimizer], [scheduler_dict]
 
-  def _q_xt(self, x, move_chance):
-    """Computes the noisy sample xt.
-
-    Args:
-      x: int torch.Tensor with shape (batch_size,
-          diffusion_model_input_length), input.
-      move_chance: float torch.Tensor with shape
-        (batch_size, 1).
-    """
-    move_indices = torch.rand(
-      *x.shape, device=x.device) < move_chance
-    if self.config.diffusion == 'absorbing_state':
-      return torch.where(move_indices, self.mask_index, x)
-    if self.config.diffusion == 'uniform':
-      uniform_tensor = torch.randint(
-        0, self.vocab_size, x.shape, device=x.device)
-      return torch.where(move_indices, uniform_tensor, x)
-    raise NotImplementedError(
-        f'Diffusion type {self.config.diffusion} not '
-        'implemented.')
-
-  def _get_time_conditioning_and_move_chance(self, t):
-    if self.T > 0:
-      t = (t * self.T).to(torch.int)
-      t = t / self.T
-      # t \in {1/T, 2/T, ..., 1}
-      t += (1 / self.T)
-    if self.change_of_variables:
-      time_conditioning = t[:, None]
-      f_T = torch.log1p(- torch.exp(- self.noise.sigma_max))
-      f_0 = torch.log1p(- torch.exp(- self.noise.sigma_min))
-      move_chance = torch.exp(f_0 + t * (f_T - f_0))
-      move_chance = move_chance[:, None]
-    else:
-      sigma, _ = self.noise(t)
-      time_conditioning = sigma[:, None]
-      move_chance = 1 - torch.exp(-sigma[:, None])
-    return time_conditioning, move_chance
-
-
   def _compute_loss(self, batch, prefix):
     # get data
     x0 = batch['input_ids']
@@ -414,6 +292,7 @@ class Classifier(L.LightningModule):
       logits = self.forward(x0, attention_mask=attention_mask)
     else:
       t = self._sample_t(x0.shape[0])
+      # time conditioning is sigma
       time_conditioning, move_chance = self._get_time_conditioning_and_move_chance(t)
       xt = self._q_xt(x0, move_chance)
       logits = self.forward(xt, time_conditioning, attention_mask=attention_mask)
@@ -436,8 +315,6 @@ class Classifier(L.LightningModule):
         reduction='mean'
     )
 
-
-
     if prefix == 'train':
       self.train_metrics.update(logits, y)
       metrics = self.train_metrics
@@ -455,24 +332,3 @@ class Classifier(L.LightningModule):
                   on_epoch=True,
                   sync_dist=True)
     return loss
-
-  def _sample_t(self, n):
-    _eps_t = torch.rand(n, device=self.device)
-    if self.antithetic_sampling:
-      offset = torch.arange(n, device=self.device) / n
-      _eps_t = (_eps_t / n + offset) % 1
-    t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps
-    if self.importance_sampling:
-      return self.noise.importance_sampling_transformation(
-        t)
-    return t
-
-  def _process_sigma(self, sigma):
-    if sigma.ndim > 1:
-      sigma = sigma.squeeze(-1)
-    if not self.time_conditioning:
-      sigma = torch.zeros_like(sigma)
-    assert sigma.ndim == 1, sigma.shape
-    return sigma
-
-
