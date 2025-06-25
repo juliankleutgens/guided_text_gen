@@ -169,11 +169,13 @@ def train_ratio_model(config, train_ds_src, valid_ds_src,callbacks,
         config.classifier_ti.retrain_when_loaded,
     )
     if (not loaded_ti) or config.classifier_ti.retrain_when_loaded:
+        cbs =  utils.load_callbacks("_classifier", config.checkpointing.save_dir)
         trainer = hydra.utils.instantiate(  # unchanged
             config.trainer_ti,
             default_root_dir=os.path.join(
                 config.checkpointing.save_dir, "ti_classifier"),
-            callbacks=utils._callbacks_for("ti_classifier", config.checkpointing.save_dir, callbacks),
+            callbacks=utils._callbacks_for("ti_classifier", config.checkpointing.save_dir,
+                                           callbacks, config.training_classifier.val_metric_for_best_model),
             strategy=hydra.utils.instantiate(config.strategy),
             logger=wandb_logger,
         )
@@ -193,7 +195,8 @@ def train_ratio_model(config, train_ds_src, valid_ds_src,callbacks,
             config.trainer_td,
             default_root_dir=os.path.join(
                 config.checkpointing.save_dir, "td_classifier"),
-            callbacks=utils._callbacks_for("td_classifier", config.checkpointing.save_dir, callbacks),
+            callbacks=utils._callbacks_for("td_classifier", config.checkpointing.save_dir, callbacks,
+                                           config.training_classifier.val_metric_for_best_model),
             strategy=hydra.utils.instantiate(config.strategy),
             logger=wandb_logger,
         )
@@ -201,8 +204,10 @@ def train_ratio_model(config, train_ds_src, valid_ds_src,callbacks,
                     ckpt_path=config.classifier_td.ckpt_path or None)
 
     # ------- 3) ratio model -------
-    train_paired_loader = dataloader.PairedDomainLoader(train_ds_src, train_ds_tgt)
-    valid_paired_loader = dataloader.PairedDomainLoader(valid_ds_src, valid_ds_tgt)
+    train_paired_loader = L.pytorch.utilities.combined_loader.CombinedLoader(
+        {"src": train_ds_src, "tgt": train_ds_tgt}, mode="max_size_cycle")
+    valid_paired_loader = L.pytorch.utilities.combined_loader.CombinedLoader(
+        {"src": valid_ds_src, "tgt": train_ds_tgt}, mode="max_size_cycle")
     ratio_net, loaded_ratio = utils.build_or_load(
         ratio.RatioEstimator,
         dict(
@@ -219,7 +224,8 @@ def train_ratio_model(config, train_ds_src, valid_ds_src,callbacks,
             config.trainer_ratio,
             default_root_dir=os.path.join(
                 config.checkpointing.save_dir, "ratio_model"),
-            callbacks=utils._callbacks_for("ratio_model", config.checkpointing.save_dir, callbacks),
+            callbacks=utils._callbacks_for("ratio_model", config.checkpointing.save_dir, callbacks,
+                                           config.training_ratio.val_metric_for_best_model),
             strategy=hydra.utils.instantiate(config.strategy),
             logger=wandb_logger,
         )

@@ -11,6 +11,10 @@ import fsspec
 import lightning
 import torch
 from timm.scheduler import CosineLRScheduler
+import copy
+from pathlib import Path
+import yaml, hydra, os
+import lightning.pytorch as pl
 
 
 def filter_arxiv_dataset_by_domain(dataset, domain_key):
@@ -318,7 +322,15 @@ def print_num_parameters(model: torch.nn.Module, verbose: bool = True, print_pre
         print(f"{print_prefix}Trainable parameters: {trainable_params:,}")
 
 
+import os
+import torch
+
 def build_or_load(model_cls, init_kwargs, ckpt_path=None, freeze=False):
+    """
+    Loads model from checkpoint if available, otherwise initializes a new one.
+    If loaded, checks only specific config attributes for consistency.
+    """
+    # 1) load or init
     if ckpt_path and os.path.exists(ckpt_path):
         model = model_cls.load_from_checkpoint(ckpt_path, **init_kwargs)
         loaded = True
@@ -326,26 +338,43 @@ def build_or_load(model_cls, init_kwargs, ckpt_path=None, freeze=False):
         model = model_cls(**init_kwargs)
         loaded = False
 
-    # --- make sure the checkpoint really is the right kind of model -----------
+    # 2) sanity‐check: right class
     if loaded and not isinstance(model, model_cls):
         raise TypeError(
             f"Checkpoint at '{ckpt_path}' contains a "
             f"{type(model).__name__}; expected {model_cls.__name__}"
         )
 
+    # 3) if loaded, compare only the chosen attrs
+    if loaded:
+        # Instantiate a fresh model to compare against
+        model_scratch = model_cls(**init_kwargs)
+        keys_to_check = ["time_conditioning", "T", "change_of_variables"]
+        for key in keys_to_check:
+            # only if the attribute actually exists on the model
+            if hasattr(model_scratch, key) and hasattr(model, key):
+                before = getattr(model_scratch, key)
+                after  = getattr(model, key)
+                if before != after:
+                    raise ValueError(
+                        f"Checkpoint at '{ckpt_path}' has a different value for "
+                        f"'{key}': checkpoint={after} vs fresh={before}"
+                    )
+
+    # 4) optionally freeze
+    if freeze and loaded:
+        for p in model.parameters():
+            p.requires_grad = False
 
     return model, loaded
 
 
 
-    # --- helper: clone callbacks and route checkpoints ----------
-import copy
-
-def _callbacks_for(subdir: str, checkpoint_save_dir: str, callbacks):
-    """Return a deep‑copied callbacks list whose ModelCheckpoint
-    saves to .../<subdir>/checkpoints/.
+def _callbacks_for(subdir: str, checkpoint_save_dir: str, callbacks, monitor_metric: str = 'gen_ppl'):
+    #Return a deep‑copied callbacks list whose ModelCheckpoint
+    #saves to .../<subdir>/checkpoints/.
     #config.checkpointing.save_dir
-    """
+    
     cbs = []
     for cb in callbacks:
         cb_new = copy.deepcopy(cb)
@@ -354,9 +383,37 @@ def _callbacks_for(subdir: str, checkpoint_save_dir: str, callbacks):
                 checkpoint_save_dir, subdir, "checkpoints"
             )
             # Special‑case: for the ratio model we want to track a different metric
-            # ToDo: this is a hack, should be fixed in the config make a new config for ratio model
-            if subdir == 'ratio_model' and getattr(cb_new, 'monitor', None) == 'val/cross_entropy':
-                cb_new.monitor = 'val/total'  # RatioEstimator logs val/total, not val/cross_entropy
+            # ToDo: !!this is a hack, should be fixed in the config make a new config for ratio model!!
+            if getattr(cb_new, 'monitor', None) is not None:
+                cb_new.monitor = f'val/{monitor_metric}'
         cbs.append(cb_new)
     return cbs
+
+
+_ALWAYS = ["checkpoint_every_n_steps.yaml", "learning_rate_monitor.yaml"]
+
+def _fix_dir(cb: pl.callbacks.Callback, subdir: str, root: str):
+    """Point every ModelCheckpoint at  …/<subdir>/checkpoints/ ."""
+    if isinstance(cb, pl.callbacks.ModelCheckpoint):
+        cb.dirpath = os.path.join(root, subdir, "checkpoints")
+
+def load_callbacks(subdir: str, checkpoint_root: str) -> list[pl.callbacks.Callback]:
+    """
+    • Always loads checkpoint_every_n_steps.yaml and learning_rate_monitor.yaml
+    • Additionally loads checkpoint_monitor_<subdir>.yaml if it exists
+    """
+    here = Path(__file__).resolve().parent
+    files = _ALWAYS + [f"checkpoint_monitor_{subdir}.yaml"]
+
+    callbacks: list[pl.callbacks.Callback] = []
+    for name in files:
+        path = here / name
+        if not path.exists():
+            continue
+        cfg_dict = yaml.safe_load(path.read_text()) or {}
+        for spec in cfg_dict.values():          # top-level keys are just wrappers
+            cb = hydra.utils.instantiate(spec)
+            _fix_dir(cb, subdir, checkpoint_root)
+            callbacks.append(cb)
+    return callbacks
 

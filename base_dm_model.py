@@ -67,8 +67,8 @@ class BaseDMModel(L.LightningModule):
             'optimizer']['step']['total']['completed']
         if 'sampler' not in checkpoint.keys():
             checkpoint['sampler'] = {}
-        if hasattr(self.trainer.train_dataloader.sampler,
-                   'state_dict'):
+        """
+        if hasattr(self.trainer.train_dataloader.sampler, 'state_dict'):
             sampler_state_dict = self.trainer. \
                 train_dataloader.sampler.state_dict()
             checkpoint['sampler'][
@@ -76,6 +76,22 @@ class BaseDMModel(L.LightningModule):
                 'random_state', None)
         else:
             checkpoint['sampler']['random_state'] = None
+        """
+        # --- save RNG state of one sampler, if available -----------------------
+        train_dl = self.trainer.train_dataloader
+        random_state = None
+
+        # CombinedLoader → dict of sub-loaders
+        if isinstance(train_dl, dict):
+            for sub_dl in train_dl.values():
+                if hasattr(sub_dl, "sampler") and hasattr(sub_dl.sampler, "state_dict"):
+                    random_state = sub_dl.sampler.state_dict().get("random_state", None)
+                    break
+        else:
+            if hasattr(train_dl, "sampler") and hasattr(train_dl.sampler, "state_dict"):
+                random_state = train_dl.sampler.state_dict().get("random_state", None)
+
+        checkpoint.setdefault("sampler", {})["random_state"] = random_state
 
     # ---------- dataloader re-wiring ---------------------------------------
     def on_train_start(self):

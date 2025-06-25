@@ -1,6 +1,7 @@
 train: arxiv_abstracts
 valid: arxiv_abstracts
 tokenizer_name_or_path: bert-base-uncased # gpt2
+path_to_data: /Users/juliankleutgens/arxiv-metadata-oai-snapshot.json # https://www.kaggle.com/datasets/Cornell-University/arxiv
 cache_dir: ~/hf_datasets_cache
 wrap: True
 streaming: False

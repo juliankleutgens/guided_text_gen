@@ -150,7 +150,7 @@ def _group_texts(examples, block_size, bos, eos):
 
 
 def get_dataset(
-    dataset_name, tokenizer, wrap, mode, cache_dir,
+    dataset_name, tokenizer, wrap, mode, cache_dir, config,
     block_size=1024, num_proc=None, streaming=False, subset_key=None,):
   if num_proc is None:
     try:
@@ -195,7 +195,7 @@ def get_dataset(
   elif dataset_name == 'arxiv_abstracts':
       ds = datasets.load_dataset(
         "json",
-        data_files="/Users/juliankleutgens/arxiv-metadata-oai-snapshot.json", # https://www.kaggle.com/datasets/Cornell-University/arxiv
+        data_files=config.data.path_to_data, # https://www.kaggle.com/datasets/Cornell-University/arxiv
         split="train",
         streaming=False
       )
@@ -391,6 +391,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode='train',
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
+      config=config,
       block_size=config.model.length,
       subset_key=subset_key)
   
@@ -409,6 +410,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       cache_dir=config.data.cache_dir,
       block_size=config.model.length,
       streaming=False,
+      config=config,
       subset_key=subset_key)
 
   # -- 3 ▸ Create the train and validation dataloaders --
@@ -599,16 +601,40 @@ def build_mixed_loader(src_loader, tgt_loader, cfg):
     )
 
 # ---------- 2. paired iterator (src-batch , tgt-batch) ------------------------
+# dataloader.py
+import torch
+from torch.utils.data import DataLoader, Dataset
+from itertools import cycle
+from typing import Iterator, Dict, Any
 
-class PairedDomainLoader:
+
+class PairedDomainLoader(DataLoader):
     """
     At every step returns a single dict that merges a *source* and a *target*
     batch.  Keys are suffixed with `_src` and `_tgt` so they stay unique.
     The longer loader defines the epoch length; the shorter one is cycled.
+
+    Sub-classing `torch.utils.data.DataLoader` is enough for Lightning’s
+    `process_dataloader()` to recognise this object as a *real* dataloader and
+    therefore *not* wrap it again.
     """
 
-    def __init__(self, src_loader, tgt_loader):
-        # decide which loader is longer
+    # --------------------------------------------------------------------- #
+    # helper: a dummy dataset that only reports its length
+    class _LengthOnlyDataset(Dataset):
+        def __init__(self, size: int):
+            self._size = size
+
+        def __len__(self):
+            return self._size
+
+        # never actually called – needed to satisfy Dataset interface
+        def __getitem__(self, idx):  # pragma: no cover
+            raise RuntimeError("This dataset is never indexed directly")
+
+    # --------------------------------------------------------------------- #
+    def __init__(self, src_loader: DataLoader, tgt_loader: DataLoader):
+        # --- decide which real loader is longer --------------------------
         if len(src_loader) >= len(tgt_loader):
             self.long_loader, self.short_loader = src_loader, tgt_loader
             self.order = ("src", "tgt")
@@ -616,24 +642,26 @@ class PairedDomainLoader:
             self.long_loader, self.short_loader = tgt_loader, src_loader
             self.order = ("tgt", "src")
 
-        # expose attributes so Lightning callbacks behave normally
+        # Lightning expects a proper DataLoader constructor call.
+        # We give it a tiny dummy-dataset whose length equals the *long* loader.
+        dummy_ds = self._LengthOnlyDataset(len(self.long_loader))
+        super().__init__(
+            dataset=dummy_ds,
+            batch_size=None,          # iteration is overridden below
+            shuffle=False,
+            num_workers=0,
+        )
+
+        # expose attributes so Lightning (and callbacks) behave normally
         self.dataset   = self.long_loader.dataset
         self.sampler   = self.long_loader.sampler
         self.tokenizer = getattr(self.long_loader.dataset, "tokenizer", None)
 
-    def __iter__(self):
-        """
-        Create *fresh* iterators for both underlying loaders every time Lightning
-        (re‑)starts an epoch.
-
-        * `long_loader` is iterated exactly once.
-        * `short_loader` is wrapped in `itertools.cycle` so that it is repeated
-          indefinitely and never exhausts.
-        """
-        long_iter  = iter(self.long_loader)          # new iterator each call
-        short_iter = cycle(iter(self.short_loader))  # idem, but endless
-
-        for long_batch in long_iter:
+    # ------------------------------------------------------------------ #
+    # core iteration logic (unchanged – just lifted over)
+    def __iter__(self) -> Iterator[Dict[str, Any]]:
+        short_iter = cycle(self.short_loader)
+        for long_batch in self.long_loader:
             short_batch = next(short_iter)
 
             # restore original (src, tgt) order
@@ -643,12 +671,30 @@ class PairedDomainLoader:
                 else
                 (short_batch, long_batch)
             )
-
             merged = {f"{k}_src": v for k, v in src_batch.items()}
             merged.update({f"{k}_tgt": v for k, v in tgt_batch.items()})
             yield merged
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.long_loader)
 
+    # ------------------------------------------------------------------ #
+    # Lightning / PyTorch sometimes clone a DataLoader with a new sampler
+    # (e.g. when `replace_sampler_ddp=True`).  Overriding the hook lets us
+    # keep the pairing logic intact while still honouring the new sampler.
+    def _clone_with_new_sampler(self, sampler, **kwargs):
+        long_new = self.long_loader.__class__(
+            dataset=self.long_loader.dataset,
+            batch_size=self.long_loader.batch_size,
+            sampler=sampler,
+            shuffle=False,
+            drop_last=False,
+            num_workers=self.long_loader.num_workers,
+            pin_memory=self.long_loader.pin_memory,
+            collate_fn=self.long_loader.collate_fn,
+            persistent_workers=self.long_loader.persistent_workers,
+        )
+        # keep the *short* loader unchanged (it will be re-cycled as before)
+        return PairedDomainLoader(long_new if self.order[0] == "src" else self.short_loader,
+                                  self.short_loader if self.order[0] == "src" else long_new)
 

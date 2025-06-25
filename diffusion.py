@@ -17,6 +17,7 @@ import dataloader
 import models
 import noise_schedule
 import utils
+from base_dm_model import BaseDMModel
 
 LOG2 = math.log(2)
 
@@ -65,7 +66,7 @@ class Perplexity(NLL):
     return torch.exp(self.mean_value / self.weight)
 
 
-class Diffusion(L.LightningModule):
+class Diffusion(BaseDMModel):
   # ==========================================
   # 0. Initialization
   # ==========================================
@@ -73,9 +74,9 @@ class Diffusion(L.LightningModule):
     self,
     config,
     tokenizer: transformers.PreTrainedTokenizer):
+    self.config = config
     super().__init__()
     self.save_hyperparameters()
-    self.config = config
 
     self.tokenizer = tokenizer
     self.vocab_size = self.tokenizer.vocab_size
@@ -166,96 +167,6 @@ class Diffusion(L.LightningModule):
     if self.subs_masking:
       assert self.parameterization == 'd3pm'
 
-  def on_load_checkpoint(self, checkpoint):
-    if self.ema:
-      self.ema.load_state_dict(checkpoint['ema'])
-    # Copied from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py#L41
-    self.fast_forward_epochs = checkpoint['loops'][
-      'fit_loop']['epoch_progress']['current']['completed']
-    self.fast_forward_batches = checkpoint['loops'][
-      'fit_loop']['epoch_loop.batch_progress'][
-        'current']['completed']
-
-  def on_save_checkpoint(self, checkpoint):
-    if self.ema:
-      checkpoint['ema'] = self.ema.state_dict()
-    # Copied from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/tasks/seq.py
-    # ['epoch_loop.batch_progress']['total']['completed'] is 1 iteration
-    # behind, so we're using the optimizer's progress.
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.batch_progress']['total'][
-        'completed'] = checkpoint['loops']['fit_loop'][
-          'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['total'][
-              'completed'] * self.trainer.accumulate_grad_batches
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.batch_progress']['current'][
-        'completed'] = checkpoint['loops']['fit_loop'][
-          'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['current'][
-              'completed'] * self.trainer.accumulate_grad_batches
-    # _batches_that_stepped tracks the number of global steps, not the number
-    # of local steps, so we don't multiply with self.trainer.accumulate_grad_batches here.
-    checkpoint['loops']['fit_loop'][
-      'epoch_loop.state_dict'][
-        '_batches_that_stepped'] = checkpoint['loops']['fit_loop'][
-          'epoch_loop.automatic_optimization.optim_progress'][
-            'optimizer']['step']['total']['completed']
-    if 'sampler' not in checkpoint.keys():
-      checkpoint['sampler'] = {}
-    if hasattr(self.trainer.train_dataloader.sampler,
-               'state_dict'):
-      sampler_state_dict = self.trainer.\
-        train_dataloader.sampler.state_dict()
-      checkpoint['sampler'][
-        'random_state'] = sampler_state_dict.get(
-          'random_state', None)
-    else:
-      checkpoint['sampler']['random_state'] = None
-
-  # ==========================================
-  # 2. Training and validation hooks
-  # ==========================================
-  def on_train_start(self):
-    """Hook called at the beginning of training."""
-    if self.ema:
-      self.ema.move_shadow_params_to_device(self.device)
-    # Adapted from:
-    # https://github.com/Dao-AILab/flash-attention/blob/main/training/src/datamodules/language_modeling_hf.py
-    distributed = (
-      self.trainer._accelerator_connector.use_distributed_sampler
-      and self.trainer._accelerator_connector.is_distributed)
-    if distributed:
-      sampler_cls = dataloader.FaultTolerantDistributedSampler
-    else:
-      sampler_cls = dataloader.RandomFaultTolerantSampler
-    updated_dls = []
-    for dl in self.trainer.fit_loop._combined_loader.flattened:
-      if hasattr(dl.sampler, 'shuffle'):
-        dl_sampler = sampler_cls(
-          dl.dataset, shuffle=dl.sampler.shuffle)
-      else:
-        dl_sampler = sampler_cls(dl.dataset)
-      if (distributed
-          and self.fast_forward_epochs is not None
-          and self.fast_forward_batches is not None):
-        dl_sampler.load_state_dict({
-          'epoch': self.fast_forward_epochs,
-          'counter': (self.fast_forward_batches
-                      * self.config.loader.batch_size)})
-      updated_dls.append(
-        torch.utils.data.DataLoader(
-          dl.dataset,
-          batch_size=self.config.loader.batch_size,
-          num_workers=self.config.loader.num_workers,
-          pin_memory=self.config.loader.pin_memory,
-          sampler=dl_sampler,
-          shuffle=False,
-          persistent_workers=True))
-    self.trainer.fit_loop._combined_loader.flattened = updated_dls
-
   def optimizer_step(self, *args, **kwargs):
     """The optimizer step for the Hydra."""
     super().optimizer_step(*args, **kwargs)
@@ -303,17 +214,6 @@ class Diffusion(L.LightningModule):
     # The below scatter operation sets the log score for the input word to 0.
     logits = torch.scatter(logits, -1, xt[..., None],torch.zeros_like(logits[..., :1]))
     return logits
-
-  def _process_sigma(self, sigma):
-    if sigma is None:
-      assert self.parameterization == 'ar'
-      return sigma
-    if sigma.ndim > 1:
-      sigma = sigma.squeeze(-1)
-    if not self.time_conditioning:
-      sigma = torch.zeros_like(sigma)
-    assert sigma.ndim == 1, sigma.shape
-    return sigma
 
   def forward(self, x, sigma):
     """Returns log score."""
@@ -581,19 +481,6 @@ class Diffusion(L.LightningModule):
         self.gen_ppl_metric.update(
           nlls, first_eos[..., 1:] + token_mask[..., 1:])
 
-  def q_xt(self, x, move_chance):
-    """Computes the noisy sample xt.
-
-    Args:
-      x: int torch.Tensor with shape (batch_size,
-          diffusion_model_input_length), input. 
-      move_chance: float torch.Tensor with shape (batch_size, 1).
-    """
-    move_indices = torch.rand(
-      * x.shape, device=x.device) < move_chance
-    xt = torch.where(move_indices, self.mask_index, x)
-    return xt
-
   def _sample_prior(self, *batch_dims):
     return self.mask_index * torch.ones(
       * batch_dims, dtype=torch.int64)
@@ -787,16 +674,6 @@ class Diffusion(L.LightningModule):
                         0)[..., None]
     return edge
 
-  def _sample_t(self, n, device):
-    _eps_t = torch.rand(n, device=device)
-    if self.antithetic_sampling:
-      offset = torch.arange(n, device=device) / n
-      _eps_t = (_eps_t / n + offset) % 1
-    t = (1 - self.sampling_eps) * _eps_t + self.sampling_eps
-    if self.importance_sampling:
-      return self.noise.importance_sampling_transformation(t)
-    return t
-
   def _maybe_sub_sample(self, x0, attention_mask):
     seqlen = x0.shape[1]
     if seqlen > self.config.model.length:
@@ -835,7 +712,7 @@ class Diffusion(L.LightningModule):
                           index=x0[:, :, None]).squeeze(-1)
 
   def _forward_pass_diffusion(self, x0):
-    t = self._sample_t(x0.shape[0], x0.device)
+    t = self._sample_t(x0.shape[0])
     if self.T > 0:
       t = (t * self.T).to(torch.int)
       t = t / self.T
@@ -853,7 +730,7 @@ class Diffusion(L.LightningModule):
       unet_conditioning = sigma[:, None]
       move_chance = 1 - torch.exp(-sigma[:, None])
 
-    xt = self.q_xt(x0, move_chance)
+    xt = self._q_xt(x0, move_chance)
     model_output = self.forward(xt, unet_conditioning)
     utils.print_nans(model_output, 'model_output')
 

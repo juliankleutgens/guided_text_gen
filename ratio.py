@@ -103,8 +103,12 @@ class RatioEstimator(BaseDMModel):
     # ================================================================
     # ▸ core loss computation
     def _compute_losses(self, batch):
-        x0_src, x0_tgt = batch["input_ids_src"], batch["input_ids_tgt"]
-        attention_mask_src, attention_mask_tgt = batch["attention_mask_src"], batch["attention_mask_tgt"]
+        batch_src = batch["src"]  # was: batch
+        batch_tgt = batch["tgt"]
+
+        x0_src, x0_tgt = batch_src["input_ids"], batch_tgt["input_ids"]
+        attention_mask_src = batch_src["attention_mask"]
+        attention_mask_tgt = batch_tgt["attention_mask"]
         B_src = x0_src.size(0)
 
         # ---------- source branch ----------
@@ -127,10 +131,10 @@ class RatioEstimator(BaseDMModel):
             move_chance_tgt = 1 - torch.exp(-sigma_tgt)
             x_t_tgt = self._q_xt(x0_tgt, move_chance_tgt[:, None])
             with torch.no_grad():
-                c_tdep = self.domain_classifier_t(x_t_tgt, t_tgt).squeeze(-1)
+                c_tdep = self.domain_classifier_t(x_t_tgt, sigma_tgt, attention_mask=attention_mask_tgt).squeeze(-1)
                 r_tdep = (-c_tdep if not self.config.training_ratio.classifier_output_with_sigmoid
                           else torch.log((1 - c_tdep) / (c_tdep + 1e-8) + 1e-8))
-            r_pred_tgt = self(x_t_tgt, t_tgt)
+            r_pred_tgt = self(x_t_tgt, sigma=sigma_tgt, attention_mask=attention_mask_tgt)
             loss_cycle = self.mse(r_pred_tgt, r_tdep)
         else:
             loss_cycle = torch.zeros((), device=self.device)

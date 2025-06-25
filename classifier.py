@@ -200,7 +200,7 @@ class Classifier(BaseDMModel):
           # For PPLM / NoS fine‑tuning
           self.classifier_model.load_pretrained_encoder(pretrained_backbone)
 
-      utils.print_num_parameters(self.classifier_model, print_prefix="Classifier model ")
+      #utils.print_num_parameters(self.classifier_model, print_prefix="Classifier model ")
 
       # --------------------------------------------------
       # 6 ▸ Metrics
@@ -292,9 +292,9 @@ class Classifier(BaseDMModel):
       logits = self.forward(x0, attention_mask=attention_mask)
     else:
       t = self._sample_t(x0.shape[0])
-      # time conditioning is sigma
       time_conditioning, move_chance = self._get_time_conditioning_and_move_chance(t)
       xt = self._q_xt(x0, move_chance)
+      # time conditioning is sigma when change_of_variables is False, else it is t
       logits = self.forward(xt, time_conditioning, attention_mask=attention_mask)
 
 

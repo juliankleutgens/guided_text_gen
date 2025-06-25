@@ -52,12 +52,14 @@ training: &base_training
 training_classifier:
   <<: *base_training
   use_label_smoothing: True
+  val_metric_for_best_model: cross_entropy # gen_ppl / cross_entropy / total
 
 training_ratio:
   <<: *base_training
   eta1: 0.1 # the cycle regularization is used
   eta2: 0.0 # the consistency regularization is used
   classifier_output_with_sigmoid: false
+  val_metric_for_best_model: total
 
 eval:
   checkpoint_path: ''  # Used to evaluate a checkpoint after training.
@@ -92,11 +94,11 @@ trainer: &base_trainer
   val_check_interval: 1.0  # validate every epoch
 
 classifier_ti:
-  ckpt_path: "/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/ti_classifier/checkpoints/best.ckpt"         # leave blank to train from scratch
+  ckpt_path: ""#"/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/ti_classifier/checkpoints/best.ckpt"         # leave blank to train from scratch
   retrain_when_loaded: false   # just use it, don't train
 
 classifier_td:
-  ckpt_path: "/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/td_classifier/checkpoints/best.ckpt"
+  ckpt_path: ""#"/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/td_classifier/checkpoints/best.ckpt"
   retrain_when_loaded: false  # just use it, don't train
 
 ratio_model:
@@ -112,7 +114,6 @@ trainer_td:                            # TD classifier trainer
   max_steps: 20
 
 trainer_ratio:                         # ratio model trainer
-  # ToDo: Why does ratio training take so much longer?
   <<: *base_trainer
   max_steps: 5
 
