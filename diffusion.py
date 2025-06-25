@@ -15,6 +15,7 @@ from torch import Tensor
 
 import dataloader
 import models
+import ratio
 import noise_schedule
 import utils
 from base_dm_model import BaseDMModel
@@ -723,7 +724,7 @@ class Diffusion(BaseDMModel):
       unet_conditioning = t[:, None]
       f_T = torch.log1p(- torch.exp(- self.noise.sigma_max))
       f_0 = torch.log1p(- torch.exp(- self.noise.sigma_min))
-      move_chance = torch.exp(f_0 + t * (f_T - f_0))
+      move_chance = torch.exp(f_0 + tWh * (f_T - f_0))
       move_chance = move_chance[:, None]
     else:
       sigma, dsigma = self.noise(t)
@@ -863,29 +864,79 @@ class Diffusion(BaseDMModel):
     return (sampling_steps, intermediate_text_samples,
             sequence_lengths)
 
-  def restore_model_and_semi_ar_sample(
-      self, stride_length, num_strides, dt=0.001):
-    """Generate samples from the model."""
-    # Lightning auto-casting is not working in this method for some reason
-    if self.ema:
-      self.ema.store(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
-      self.ema.copy_to(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
-    self.backbone.eval()
-    self.noise.eval()
-    (sampling_steps, samples,
-     sequence_lengths) = self.sample_subs_guidance(
-      n_samples=self.config.loader.eval_batch_size,
-      stride_length=stride_length,
-      num_strides=num_strides, 
-      dt=dt)
-    if self.ema:
-      self.ema.restore(itertools.chain(
-        self.backbone.parameters(),
-        self.noise.parameters()))
-    self.backbone.train()
-    self.noise.train()
-    return sampling_steps, samples, sequence_lengths
+  def _ratio_guidance_denoise(
+      self,
+      gamma: float,
+      ratio_model: ratio.RatioEstimator,
+      xt: torch.tensor,
+      time_conditioning: torch.tensor,
+      move_chance_t: torch.tensor,
+      move_chance_s: torch.tensor,
+      cache: typing.Optional[typing.Dict[str, torch.Tensor]] = None,
+  ) -> typing.Tuple[torch.tensor, torch.tensor, typing.Dict[str, torch.tensor]]:
+
+    if cache is not None:
+      log_x_theta = cache['log_x_theta']
+      classifier_log_prob = cache['classifier_log_prob']
+    else:
+      # Diffusion model
+      log_x_theta = self.forward(xt, time_conditioning,cond=None)
+
+    # Copied from https://github.com/hnisonoff/discrete_guidance/blob/main/src/fm_utils.py#L441
+    bsz, seq_len = xt.shape
+
+
+    xt_expand = xt.unsqueeze(1).repeat(1, seq_len * self.vocab_size, 1)
+    xt_expand = xt_expand.view(-1, seq_len)
+
+    jump_idx = torch.arange(seq_len * self.vocab_size).to(xt.device)
+    jump_idx = jump_idx.repeat(bsz, 1).flatten()
+    xt_jumps = xt_expand.clone()
+    jump_dims = jump_idx // self.vocab_size
+    jump_states = jump_idx % self.vocab_size
+    xt_jumps[
+      torch.arange(jump_idx.size(0), device=xt.device),
+      jump_dims,  # Index the transitioned dimension
+    ] = jump_states  # Assign the new state
+
+    classifier_log_prob = ratio_model.get_log_probs(
+      xt_jumps, time_conditioning.repeat(seq_len * self.vocab_size)
+    ).reshape(bsz, seq_len, self.vocab_size)
+
+    # Compute unguided posterior
+    if self.diffusion == 'absorbing_state':
+      diffusion_log_probs = log_x_theta + torch.log(
+        1. - (move_chance_s / move_chance_t))
+      diffusion_log_probs[..., self.mask_index] = torch.log(
+        move_chance_s / move_chance_t)[:, :, 0]
+      diffusion_log_probs.detach()
+    elif self.diffusion == 'uniform':
+      diffusion_log_probs = self._compute_posterior(
+        x=log_x_theta.exp(),
+        xt=xt,
+        alpha_s=1 - move_chance_s,
+        alpha_t=1 - move_chance_t).log()
+    else:
+      raise NotImplementedError(
+        f"Diffusion type {self.diffusion} not implemented.")
+
+    # Apply guidance
+    with torch.no_grad():
+      if self.diffusion == 'absorbing_state':
+        guided_log_probs = (gamma * classifier_log_prob) + diffusion_log_probs
+        copy_flag = (xt != self.mask_index)
+        guided_log_probs[copy_flag] = self.neg_infinity
+        guided_log_probs[copy_flag, xt[copy_flag]] = 0.0
+      elif self.diffusion == 'uniform':
+        guided_log_probs = (gamma * classifier_log_prob) + diffusion_log_probs
+      else:
+        raise NotImplementedError(
+          f"Diffusion type {self.diffusion} not implemented.")
+
+    guided_probs = guided_log_probs.softmax(dim=-1)
+    # Sample from guided posterior
+    xs = _sample_categorical(guided_probs)
+    if self.diffusion == 'absorbing_state':
+      xs = torch.where(copy_flag.to(bool), xt, xs)
+    return xs, guided_probs, {'log_x_theta': log_x_theta,
+                              'classifier_log_prob': classifier_log_prob}

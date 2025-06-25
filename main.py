@@ -1,9 +1,11 @@
 import os
+import typing
 
 import fsspec
 import hydra
 import lightning as L
 import omegaconf
+from omegaconf import DictConfig
 import rich.syntax
 import rich.tree
 import torch
@@ -88,11 +90,154 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
     print(f'Last {k} tokens:', tokenizer.decode(last))
     print('ids:', last)
 
+# -----------------------------------------------------------------------------
+# General helpers
+# -----------------------------------------------------------------------------
 
+def _get_resume_ckpt(cfg: DictConfig) -> typing.Union[str, None]:
+    """Return a valid resume checkpoint path if it exists."""
+    if (
+        cfg.checkpointing.resume_from_ckpt
+        and cfg.checkpointing.resume_ckpt_path is not None
+        and utils.fsspec_exists(cfg.checkpointing.resume_ckpt_path)
+    ):
+        return cfg.checkpointing.resume_ckpt_path
+    return None
+
+
+def _make_trainer(cfg: DictConfig, callbacks: list, wandb_logger):
+    """Instantiate a Lightning trainer from a Hydra config section."""
+    return hydra.utils.instantiate(
+        cfg.trainer,
+        default_root_dir=os.getcwd(),
+        callbacks=callbacks,
+        strategy=hydra.utils.instantiate(cfg.get("strategy")),
+        logger=wandb_logger,
+    )
+
+
+# -----------------------------------------------------------------------------
+# Diffusion training
+# -----------------------------------------------------------------------------
+
+def train_diffusion_model(cfg: DictConfig, callbacks: list, wandb_logger, tokenizer):
+    """Train the diffusion model only."""
+    train_ds, valid_ds = dataloader.get_dataloaders(cfg, tokenizer, domain="src")
+
+    model = diffusion.Diffusion(cfg, tokenizer=valid_ds.tokenizer)
+    trainer = _make_trainer(cfg, callbacks, wandb_logger)
+
+    trainer.fit(model, train_ds, valid_ds, ckpt_path=_get_resume_ckpt(cfg))
+
+
+# -----------------------------------------------------------------------------
+# Classifier helpers
+# -----------------------------------------------------------------------------
+
+def _build_and_maybe_train_classifier(*, cfg: DictConfig, tokenizer, train_time_independent: bool,
+                                      loader_pair: tuple, section_cfg: DictConfig,
+                                      trainer_cfg: DictConfig, name: str,
+                                      callbacks: list, wandb_logger):
+    """Create (or load) a classifier and train if necessary."""
+    cls, loaded = utils.build_or_load(
+        classifier.Classifier,
+        dict(
+            config=cfg,
+            tokenizer=tokenizer,
+            train_time_independent=train_time_independent,
+        ),
+        section_cfg.ckpt_path,
+        section_cfg.retrain_when_loaded,
+    )
+
+    if (not loaded) or section_cfg.retrain_when_loaded:
+        train_loader, valid_loader = loader_pair
+        trainer = _make_trainer(cfg, utils._callbacks_for(name, cfg.checkpointing.save_dir, callbacks, cfg.training_classifier.val_metric_for_best_model), wandb_logger)
+        trainer.fit(cls, train_loader, valid_loader, ckpt_path=section_cfg.ckpt_path or None)
+    return cls
+
+
+def train_classifier_models(cfg: DictConfig, callbacks: list, wandb_logger, tokenizer, train_loader, valid_loader):
+    """Train / load both time‑independent and time‑dependent classifiers."""
+    cls_ti = _build_and_maybe_train_classifier(
+        cfg=cfg,
+        tokenizer=tokenizer,
+        train_time_independent=True,
+        loader_pair=(train_loader, valid_loader),
+        section_cfg=cfg.classifier_ti,
+        trainer_cfg=cfg.trainer_ti,
+        name="ti_classifier",
+        callbacks=callbacks,
+        wandb_logger=wandb_logger,
+    )
+    cls_td = _build_and_maybe_train_classifier(
+        cfg=cfg,
+        tokenizer=tokenizer,
+        train_time_independent=False,
+        loader_pair=(train_loader, valid_loader),
+        section_cfg=cfg.classifier_td,
+        trainer_cfg=cfg.trainer_td,
+        name="td_classifier",
+        callbacks=callbacks,
+        wandb_logger=wandb_logger,
+    )
+    return cls_ti, cls_td
+
+
+# -----------------------------------------------------------------------------
+# Ratio training pipeline
+# -----------------------------------------------------------------------------
+
+def train_ratio_pipeline(cfg: DictConfig, callbacks: list, wandb_logger, tokenizer):
+    """Full pipeline for training source/target classifiers and the ratio model."""
+
+    # 1. Build mixed loaders for source and target domains
+    train_ds_src, valid_ds_src = dataloader.get_dataloaders(cfg, tokenizer, domain="src")
+    train_ds_tgt, valid_ds_tgt = dataloader.get_dataloaders(cfg, tokenizer, domain="tgt")
+
+    train_loader = dataloader.build_mixed_loader(train_ds_src, train_ds_tgt, cfg)
+    valid_loader = dataloader.build_mixed_loader(valid_ds_src, valid_ds_tgt, cfg)
+
+    # 2. Train / load classifiers
+    cls_ti, cls_td = train_classifier_models(
+        cfg, callbacks, wandb_logger, tokenizer, train_loader, valid_loader
+    )
+
+    # 3. Train / load ratio estimator
+    paired_train = L.pytorch.utilities.combined_loader.CombinedLoader(
+        {"src": train_ds_src, "tgt": train_ds_tgt}, mode="max_size_cycle"
+    )
+    paired_valid = L.pytorch.utilities.combined_loader.CombinedLoader(
+        {"src": valid_ds_src, "tgt": valid_ds_tgt}, mode="max_size_cycle"
+    )
+
+    ratio_net, loaded_ratio = utils.build_or_load(
+        ratio.RatioEstimator,
+        dict(
+            config=cfg,
+            tokenizer=train_ds_src.tokenizer,
+            domain_classifier=cls_ti,
+            domain_classifier_time_dependent=cls_td,
+        ),
+        cfg.ratio_model.ckpt_path,
+        cfg.ratio_model.retrain_when_loaded,
+    )
+
+    if (not loaded_ratio) or cfg.ratio_model.retrain_when_loaded:
+        trainer = _make_trainer(
+            cfg,
+            utils._callbacks_for("ratio_model", cfg.checkpointing.save_dir, callbacks, cfg.training_ratio.val_metric_for_best_model),
+            wandb_logger,
+        )
+        trainer.fit(ratio_net, paired_train, paired_valid, ckpt_path=cfg.ratio_model.ckpt_path or None)
+
+
+# -----------------------------------------------------------------------------
+# Evaluation helpers – unchanged from the original script
+# -----------------------------------------------------------------------------
 def generate_samples(config, logger, tokenizer):
   logger.info('Generating samples.')
-  model = _load_from_checkpoint(config=config,
-                                tokenizer=tokenizer)
+  model = _load_from_checkpoint(config=config,tokenizer=tokenizer)
   model.gen_ppl_metric.reset()
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
@@ -100,7 +245,7 @@ def generate_samples(config, logger, tokenizer):
   stride_length = config.sampling.stride_length
   num_strides = config.sampling.num_strides
   for _ in range(config.sampling.num_sample_batches):
-    if config.sampling.semi_ar:
+    if config.sampling:
       _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
         stride_length=stride_length,
         num_strides=num_strides,
@@ -117,6 +262,8 @@ def generate_samples(config, logger, tokenizer):
     print('Generative perplexity:',
           model.gen_ppl_metric.compute())
   return text_samples
+
+
 
 def _ppl_eval(config, logger, tokenizer):
   logger.info('Starting Zero Shot Eval.')
@@ -146,158 +293,46 @@ def _ppl_eval(config, logger, tokenizer):
     config, tokenizer, skip_train=True, valid_seed=config.seed)
   trainer.validate(model, valid_ds)
 
-def train_ratio_model(config, train_ds_src, valid_ds_src,callbacks,
-                        train_ds_tgt, valid_ds_tgt, wandb_logger, ckpt_path):
-    """Train the ratio model."""
+
+# -----------------------------------------------------------------------------
+# Main entry point
+# -----------------------------------------------------------------------------
+
+@hydra.main(version_base=None, config_path="configs", config_name="config")
+def main(cfg: DictConfig) -> None:
+    """Dispatch to the appropriate training or evaluation routine."""
+    L.seed_everything(cfg.seed)
+    _print_config(cfg, resolve=True, save_cfg=True)
+
     logger = utils.get_logger(__name__)
-    logger.info('Starting Ratio Model Training.')
+    tokenizer = dataloader.get_tokenizer(cfg)
 
-    # make check that the configuration and loader are compatible
-    _ = utils.make_checks_if_config_and_loader_is_synchronized(
-        config, train_ds_src, valid_ds_src, train_ds_tgt, valid_ds_tgt)
-    # Todo: add the pretrained backbone loading
-    train_loader = dataloader.build_mixed_loader(train_ds_src, train_ds_tgt, config)
-    valid_loader = dataloader.build_mixed_loader(valid_ds_src, valid_ds_tgt, config)
+    # Setup logging
+    wandb_logger = None
+    if cfg.get("wandb") is not None:
+        wandb_kwargs = {
+            "config": omegaconf.OmegaConf.to_object(cfg),
+            **cfg.wandb,
+        }
+        wandb_logger = L.pytorch.loggers.WandbLogger(**wandb_kwargs)
 
+    callbacks = []
+    if "callbacks" in cfg:
+        callbacks = [hydra.utils.instantiate(cb) for cb in cfg.callbacks.values()]
 
-    # ------- 1) time-independent classifier -------
-    cls_ti, loaded_ti = utils.build_or_load(
-        classifier.Classifier,
-        dict(config=config, tokenizer=train_ds_src.tokenizer,
-             train_time_independent=True),
-        config.classifier_ti.ckpt_path,
-        config.classifier_ti.retrain_when_loaded,
-    )
-    if (not loaded_ti) or config.classifier_ti.retrain_when_loaded:
-        trainer = hydra.utils.instantiate(  # unchanged
-            config.trainer_ti,
-            default_root_dir=os.path.join(
-                config.checkpointing.save_dir, "ti_classifier"),
-            callbacks=utils._callbacks_for("ti_classifier", config.checkpointing.save_dir,
-                                           callbacks, config.training_classifier.val_metric_for_best_model),
-            strategy=hydra.utils.instantiate(config.strategy),
-            logger=wandb_logger,
-        )
-        trainer.fit(cls_ti, train_loader, valid_loader,
-                    ckpt_path=config.classifier_ti.ckpt_path or None)
+    # Dispatch by mode
 
-    # ------- 2) time-dependent classifier -------
-    cls_td, loaded_td = utils.build_or_load(
-        classifier.Classifier,
-        dict(config=config, tokenizer=train_ds_src.tokenizer,
-             train_time_independent=False),
-        config.classifier_td.ckpt_path,
-        config.classifier_td.retrain_when_loaded,
-    )
-    if (not loaded_td) or config.classifier_td.retrain_when_loaded:
-        trainer = hydra.utils.instantiate(  # unchanged
-            config.trainer_td,
-            default_root_dir=os.path.join(
-                config.checkpointing.save_dir, "td_classifier"),
-            callbacks=utils._callbacks_for("td_classifier", config.checkpointing.save_dir, callbacks,
-                                           config.training_classifier.val_metric_for_best_model),
-            strategy=hydra.utils.instantiate(config.strategy),
-            logger=wandb_logger,
-        )
-        trainer.fit(cls_td, train_loader, valid_loader,
-                    ckpt_path=config.classifier_td.ckpt_path or None)
+    if cfg.mode == "train":
+        train_diffusion_model(cfg, callbacks, wandb_logger, tokenizer)
+    elif cfg.mode == "train_ratio":
+        train_ratio_pipeline(cfg, callbacks, wandb_logger, tokenizer)
+    elif cfg.mode ==  "sample_eval":
+        generate_samples(cfg, logger, tokenizer)
+    elif cfg.mode == "ppl_eval":
+        _ppl_eval(cfg, logger, tokenizer)
+    else:
+        raise ValueError(f"Unknown mode: {cfg.mode}")
 
-    # ------- 3) ratio model -------
-    train_paired_loader = L.pytorch.utilities.combined_loader.CombinedLoader(
-        {"src": train_ds_src, "tgt": train_ds_tgt}, mode="max_size_cycle")
-    valid_paired_loader = L.pytorch.utilities.combined_loader.CombinedLoader(
-        {"src": valid_ds_src, "tgt": train_ds_tgt}, mode="max_size_cycle")
-    ratio_net, loaded_ratio = utils.build_or_load(
-        ratio.RatioEstimator,
-        dict(
-            config=config,
-            tokenizer=train_ds_src.tokenizer,
-            domain_classifier=cls_ti,
-            domain_classifier_time_dependent=cls_td,
-        ),
-        config.ratio_model.ckpt_path,
-        config.ratio_model.retrain_when_loaded,
-    )
-    if (not loaded_ratio) or config.ratio_model.retrain_when_loaded:
-        trainer = hydra.utils.instantiate(
-            config.trainer_ratio,
-            default_root_dir=os.path.join(
-                config.checkpointing.save_dir, "ratio_model"),
-            callbacks=utils._callbacks_for("ratio_model", config.checkpointing.save_dir, callbacks,
-                                           config.training_ratio.val_metric_for_best_model),
-            strategy=hydra.utils.instantiate(config.strategy),
-            logger=wandb_logger,
-        )
-        trainer.fit(ratio_net, train_paired_loader, valid_paired_loader,
-                    ckpt_path=config.ratio_model.ckpt_path or None)
-def _train(config, logger, tokenizer, train_ratio=False):
-  logger.info('Starting Training.')
-  wandb_logger = None
-  if config.get('wandb', None) is not None:
-    # Prepare wandb logger keyword arguments
-    wandb_kwargs = {
-      'config': omegaconf.OmegaConf.to_object(config),
-      **config.wandb}
-
-    # If training the ratio model, append '-ratio' to the run name
-    if train_ratio and 'name' in wandb_kwargs:
-        wandb_kwargs['name'] = f"{wandb_kwargs['name']}-ratio"
-    wandb_logger = L.pytorch.loggers.WandbLogger(**wandb_kwargs)
-
-  if (config.checkpointing.resume_from_ckpt
-      and config.checkpointing.resume_ckpt_path is not None
-      and utils.fsspec_exists(
-        config.checkpointing.resume_ckpt_path)):
-    ckpt_path = config.checkpointing.resume_ckpt_path
-  else:
-    ckpt_path = None
-
-  # Lightning callbacks
-  callbacks = []
-  if 'callbacks' in config:
-    for _, callback in config.callbacks.items():
-      callbacks.append(hydra.utils.instantiate(callback))
-
-  train_ds, valid_ds = dataloader.get_dataloaders(config, tokenizer, domain='src')
-  #_print_batch(train_ds, valid_ds, tokenizer)
-
-  if train_ratio:
-    # For training the ratio model both source and target datasets are needed
-    train_ds_tgt, valid_ds_tgt = dataloader.get_dataloaders(config, tokenizer, domain='tgt')
-    train_ratio_model(config=config,
-                      train_ds_src=train_ds, valid_ds_src=valid_ds,
-                      callbacks=callbacks,
-                      train_ds_tgt=train_ds_tgt, valid_ds_tgt=valid_ds_tgt,
-                      wandb_logger=wandb_logger, ckpt_path=ckpt_path)
-  else:
-    model = diffusion.Diffusion(
-      config, tokenizer=valid_ds.tokenizer)
-
-    trainer = hydra.utils.instantiate(
-      config.trainer,
-      default_root_dir=os.getcwd(),
-      callbacks=callbacks,
-      strategy=hydra.utils.instantiate(config.strategy),
-      logger=wandb_logger)
-    trainer.fit(model, train_ds, valid_ds, ckpt_path=ckpt_path)
-
-
-@hydra.main(version_base=None, config_path='configs',
-            config_name='config')
-def main(config):
-  """Main entry point for training."""
-  L.seed_everything(config.seed)
-  _print_config(config, resolve=True, save_cfg=True)
-  
-  logger = utils.get_logger(__name__)
-  tokenizer = dataloader.get_tokenizer(config)
-
-  if config.mode == 'sample_eval':
-    generate_samples(config, logger, tokenizer)
-  elif config.mode == 'ppl_eval':
-    _ppl_eval(config, logger, tokenizer)
-  else:
-    _train(config, logger, tokenizer, train_ratio = 'ratio' in config.mode)
 
 
 if __name__ == '__main__':
