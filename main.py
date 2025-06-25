@@ -169,7 +169,6 @@ def train_ratio_model(config, train_ds_src, valid_ds_src,callbacks,
         config.classifier_ti.retrain_when_loaded,
     )
     if (not loaded_ti) or config.classifier_ti.retrain_when_loaded:
-        cbs =  utils.load_callbacks("_classifier", config.checkpointing.save_dir)
         trainer = hydra.utils.instantiate(  # unchanged
             config.trainer_ti,
             default_root_dir=os.path.join(

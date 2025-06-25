@@ -389,31 +389,3 @@ def _callbacks_for(subdir: str, checkpoint_save_dir: str, callbacks, monitor_met
         cbs.append(cb_new)
     return cbs
 
-
-_ALWAYS = ["checkpoint_every_n_steps.yaml", "learning_rate_monitor.yaml"]
-
-def _fix_dir(cb: pl.callbacks.Callback, subdir: str, root: str):
-    """Point every ModelCheckpoint at  …/<subdir>/checkpoints/ ."""
-    if isinstance(cb, pl.callbacks.ModelCheckpoint):
-        cb.dirpath = os.path.join(root, subdir, "checkpoints")
-
-def load_callbacks(subdir: str, checkpoint_root: str) -> list[pl.callbacks.Callback]:
-    """
-    • Always loads checkpoint_every_n_steps.yaml and learning_rate_monitor.yaml
-    • Additionally loads checkpoint_monitor_<subdir>.yaml if it exists
-    """
-    here = Path(__file__).resolve().parent
-    files = _ALWAYS + [f"checkpoint_monitor_{subdir}.yaml"]
-
-    callbacks: list[pl.callbacks.Callback] = []
-    for name in files:
-        path = here / name
-        if not path.exists():
-            continue
-        cfg_dict = yaml.safe_load(path.read_text()) or {}
-        for spec in cfg_dict.values():          # top-level keys are just wrappers
-            cb = hydra.utils.instantiate(spec)
-            _fix_dir(cb, subdir, checkpoint_root)
-            callbacks.append(cb)
-    return callbacks
-
