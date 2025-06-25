@@ -724,7 +724,7 @@ class Diffusion(BaseDMModel):
       unet_conditioning = t[:, None]
       f_T = torch.log1p(- torch.exp(- self.noise.sigma_max))
       f_0 = torch.log1p(- torch.exp(- self.noise.sigma_min))
-      move_chance = torch.exp(f_0 + tWh * (f_T - f_0))
+      move_chance = torch.exp(f_0 + t * (f_T - f_0))
       move_chance = move_chance[:, None]
     else:
       sigma, dsigma = self.noise(t)
