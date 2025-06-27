@@ -17,26 +17,34 @@ import yaml, hydra, os
 import lightning.pytorch as pl
 
 
-def filter_arxiv_dataset_by_domain(dataset, domain_key):
-  """
-  Filter an arXiv metadata Dataset to only include records whose
-  *primary* category prefix matches domain_key.
-  """
-  if not domain_key:
-    return dataset
+def filter_arxiv_dataset_by_domain(dataset, domain_keys):
+    """
+    Filter an arXiv metadata Dataset to only include records whose
+    *primary* category prefix matches domain_key.
+    domain_keys   : str | Iterable[str] | None
+          e.g. "cs" or ["cs", "stat", "math"]
+    Returns: filtered Dataset
+    -------
+    """
+    if not domain_keys:  # None, "", [], …
+        return dataset
 
-  def _matches_primary(example):
-    cats = example.get("categories")
-    # get list of tags
-    tags = cats.split() if isinstance(cats, str) else cats if isinstance(cats, list) else []
-    if not tags:
-      return False
-    # only inspect the first (primary) tag
-    primary = tags[0]
-    prefix = primary.split('.', 1)[0]
-    return prefix == domain_key
+    # normalise to a set of prefixes
+    if isinstance(domain_keys, str):
+        domain_keys = {domain_keys}
+    else:
+        domain_keys = set(domain_keys)
 
-  return dataset.filter(_matches_primary)
+    def _matches_primary(example):
+        cats = example.get("categories")
+        tags = (cats.split() if isinstance(cats, str)
+                else cats if isinstance(cats, list) else [])
+        if not tags:
+            return False
+        primary_prefix = tags[0].split('.', 1)[0]
+        return primary_prefix in domain_keys
+
+    return dataset.filter(_matches_primary)
 
 
 def fsspec_exists(filename):
@@ -383,7 +391,7 @@ def _callbacks_for(subdir: str, checkpoint_save_dir: str, callbacks, monitor_met
                 checkpoint_save_dir, subdir, "checkpoints"
             )
             # Special‑case: for the ratio model we want to track a different metric
-            # ToDo: !!this is a hack, should be fixed in the config make a new config for ratio model!!
+            # ToDo: !!this is a hack, should be fixed in the config make a new config callbacks files for ratio model!!
             if getattr(cb_new, 'monitor', None) is not None:
                 cb_new.monitor = f'val/{monitor_metric}'
         cbs.append(cb_new)

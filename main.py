@@ -93,7 +93,6 @@ def _print_batch(train_ds, valid_ds, tokenizer, k=64):
 # -----------------------------------------------------------------------------
 # General helpers
 # -----------------------------------------------------------------------------
-
 def _get_resume_ckpt(cfg: DictConfig) -> typing.Union[str, None]:
     """Return a valid resume checkpoint path if it exists."""
     if (
@@ -119,7 +118,6 @@ def _make_trainer(cfg: DictConfig, callbacks: list, wandb_logger):
 # -----------------------------------------------------------------------------
 # Diffusion training
 # -----------------------------------------------------------------------------
-
 def train_diffusion_model(cfg: DictConfig, callbacks: list, wandb_logger, tokenizer):
     """Train the diffusion model only."""
     train_ds, valid_ds = dataloader.get_dataloaders(cfg, tokenizer, domain="src")
@@ -133,7 +131,6 @@ def train_diffusion_model(cfg: DictConfig, callbacks: list, wandb_logger, tokeni
 # -----------------------------------------------------------------------------
 # Classifier helpers
 # -----------------------------------------------------------------------------
-
 def _build_and_maybe_train_classifier(*, cfg: DictConfig, tokenizer, train_time_independent: bool,
                                       loader_pair: tuple, section_cfg: DictConfig,
                                       trainer_cfg: DictConfig, name: str,
@@ -297,12 +294,12 @@ def _ppl_eval(config, logger, tokenizer):
 # -----------------------------------------------------------------------------
 # Main entry point
 # -----------------------------------------------------------------------------
-
 @hydra.main(version_base=None, config_path="configs", config_name="config")
 def main(cfg: DictConfig) -> None:
     """Dispatch to the appropriate training or evaluation routine."""
     L.seed_everything(cfg.seed)
     _print_config(cfg, resolve=True, save_cfg=True)
+     # e.g. 1024 or 512
 
     logger = utils.get_logger(__name__)
     tokenizer = dataloader.get_tokenizer(cfg)

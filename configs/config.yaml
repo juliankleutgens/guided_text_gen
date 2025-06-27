@@ -1,3 +1,4 @@
+# ---------- Defaults ----------
 defaults:
   - _self_
   - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
@@ -6,70 +7,89 @@ defaults:
   - /strategy: ddp
   - /noise: loglinear
   - /lr_scheduler: constant_warmup
-  - /classifier_model: tiny-classifier # small / tiny
-  - /ratio_model: tiny-ratio # small / tiny
+  - /classifier_model: tiny-classifier   # options: small | tiny
+  - /ratio_model: tiny-ratio             # options: small | tiny
   - /guidance: null
 
-mode: train  # train / ppl_eval / sample_eval / train_ratio
-diffusion: absorbing_state # absorbing_state / uniform
-backbone: dit  # dit / dimamba / ar
-classifier_backbone: dit  # dit / dimamba / ar
-ratio_backbone: dit
-parameterization: subs  # subs / d3pm / sedd
-time_conditioning: True # If true noise scale σₜ is passed into your backbone. False: it helps for caching
-T: 0  # 0 (continuous time) / 1000 
-subs_masking: False # True (mask‐only): simpler corruption (MLDM) / False (full substitution, all tokens): more complex corruption (D3PM)
-
+# ---------- Global settings ----------
 seed: 1
+mode: train                              # options: train | ppl_eval | sample_eval | train_ratio
 
+# ---------- Diffusion / Model ----------
+diffusion: absorbing_state               # options: absorbing_state | uniform
+backbone: dit                            # options: dit | dimamba
+classifier_backbone: dit                 # options: dit | dimamba
+ratio_backbone: dit
+parameterization: subs                   # options: subs | d3pm | sedd
+time_conditioning: true                  # if true, σₜ is passed into backbone
+T: 0                                     # 0 = continuous time, 1000 = discrete steps
+subs_masking: false                      # true: mask‑only (MLDM) | false: full substitution (D3PM)
+
+# =====================
+#  Data Loading
+# =====================
 loader:
   global_batch_size: 64
   eval_global_batch_size: ${.global_batch_size}
-  # Note: batch_size and eval_batch_size are **per machine**
+
+  # batch_size and eval_batch_size are **per machine**
   batch_size: ${div_up:${.global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
   eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
-  num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
-  pin_memory: True
-  persistent_workers: True
 
+  num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
+  pin_memory: true
+  persistent_workers: true
+
+# =====================
+#  Sampling
+# =====================
 sampling:
-  predictor: ddpm_cache  # analytic, ddpm, ddpm_cache
+  predictor: ddpm_cache                  # options: analytic | ddpm | ddpm_cache
   steps: 128
-  noise_removal: True
-  num_sample_batches: 2  # Total samples: `num_gpus` * `loader.eval_batch_size` * num_sample_batches
+  noise_removal: true
+  num_sample_batches: 2                  # total samples = num_gpus * loader.eval_batch_size * num_sample_batches
   num_sample_log: 2
-  semi_ar: False
+  semi_ar: false
   stride_length: 1
   num_strides: 1
 
+# =====================
+#  Training (common anchor)
+# =====================
 training: &base_training
   ema: 0.9999
-  antithetic_sampling: True
-  importance_sampling: False
+  antithetic_sampling: true
+  importance_sampling: false
   sampling_eps: 1e-3
-  change_of_variables: False # switch in different noisy metric
+  change_of_variables: false            # switch in different noisy metric
 
 training_classifier:
   <<: *base_training
-  use_label_smoothing: True
-  val_metric_for_best_model: cross_entropy # gen_ppl / cross_entropy / total
+  use_label_smoothing: true
+  val_metric_for_best_model: cross_entropy   # options: gen_ppl | cross_entropy | total
 
 training_ratio:
   <<: *base_training
-  eta1: 0.1 # the cycle regularization is used
-  eta2: 0.0 # the consistency regularization is used
+  eta1: 0.1                            # cycle regularization
+  eta2: 0.0                            # consistency regularization
   classifier_output_with_sigmoid: false
   val_metric_for_best_model: total
 
+# =====================
+#  Evaluation
+# =====================
 eval:
-  checkpoint_path: ''  # Used to evaluate a checkpoint after training.
-  disable_ema: False
-  compute_generative_perplexity: False
+  checkpoint_path: ''                  # path to evaluate checkpoint after training
+  disable_ema: false
+  compute_generative_perplexity: false
   perplexity_batch_size: 8
-  compute_perplexity_on_sanity: False
-  gen_ppl_eval_model_name_or_path: gpt2-large  # gpt2-large, meta-llama/Llama-2-7b-hf
-  generate_samples: True
+  compute_perplexity_on_sanity: false
+  gen_ppl_eval_model_name_or_path: gpt2-large   # e.g. gpt2-large | meta-llama/Llama-2-7b-hf
+  generate_samples: true
 
+# =====================
+#  Optimizer
+# =====================
 optim:
   weight_decay: 0
   lr: 3e-4
@@ -77,7 +97,9 @@ optim:
   beta2: 0.999
   eps: 1e-8
 
-# trainer is passed wholesale to PyTorch Lightning’s Trainer
+# =====================
+#  Trainer (common anchor)
+# =====================
 trainer: &base_trainer
   _target_: lightning.Trainer
   accelerator: cpu
@@ -85,38 +107,45 @@ trainer: &base_trainer
   devices: ${device_count:}
   accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   gradient_clip_val: 1.0
-  precision: '32' #'bf16'
-  num_sanity_val_steps: 1 #2
-  max_steps: 20 #1_000_000
+  precision: '32'                      # 'bf16' for mixed precision
+  num_sanity_val_steps: 1
+  max_steps: 20                        # default: 1_000_000
   log_every_n_steps: 10
-  limit_train_batches: 1.0   # train on full dataset, can be used to toggle quick run
-  limit_val_batches: 1.0     # validate on full dataset, can be used to toggle quick run
-  val_check_interval: 1.0  # validate every epoch
+  limit_train_batches: 1.0             # 1.0 = full dataset
+  limit_val_batches: 1.0               # 1.0 = full dataset
+  val_check_interval: 1.0              # every epoch
 
-classifier_ti:
-  ckpt_path: ""#"/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/ti_classifier/checkpoints/best.ckpt"         # leave blank to train from scratch
-  retrain_when_loaded: false   # just use it, don't train
-
-classifier_td:
-  ckpt_path: ""#"/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/td_classifier/checkpoints/best.ckpt"
-  retrain_when_loaded: false  # just use it, don't train
-
-ratio_model:
-  ckpt_path: ""         # no pre-trained ratio -> will train
-  retrain_when_loaded: true
-
-trainer_ti:                            # TI classifier trainer
+# Trainers for different tasks
+trainer_ti:
   <<: *base_trainer
   max_steps: 20
 
-trainer_td:                            # TD classifier trainer
+trainer_td:
   <<: *base_trainer
   max_steps: 20
 
-trainer_ratio:                         # ratio model trainer
+trainer_ratio:
   <<: *base_trainer
   max_steps: 5
 
+# =====================
+#  Model checkpoints
+# =====================
+classifier_ti:
+  ckpt_path: "/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/ti_classifier/checkpoints/best.ckpt"                        # leave blank to train from scratch
+  retrain_when_loaded: false           # just use it, don't train
+
+classifier_td:
+  ckpt_path: "/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/td_classifier/checkpoints/last.ckpt"                        # leave blank to train from scratch
+  retrain_when_loaded: false           # just use it, don't train
+
+ratio_model:
+  ckpt_path: ""                        # no pre-trained ratio -> will train
+  retrain_when_loaded: true
+
+# =====================
+#  Logging
+# =====================
 wandb:
   project: text-diffusion
   notes: Mulan for text
@@ -129,15 +158,19 @@ wandb:
     - ${data.train}
     - ${data.valid}
 
+# =====================
+#  Hydra
+# =====================
 hydra:
   run:
     dir: ./outputs/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
   job:
     chdir: true
 
+# =====================
+#  Checkpointing
+# =====================
 checkpointing:
-  # Use custom `save_dir` if, e.g., saving to S3 bucket, otherwise leave this parameter as is
-  save_dir: ${cwd:}
-  # Note: `checkpoints` path should correspond to `checkpoint_every_n_steps.dirpath`
+  save_dir: ${cwd:}                    # custom dir, e.g., S3 bucket
   resume_from_ckpt: true
   resume_ckpt_path: ${.save_dir}/checkpoints/last.ckpt

@@ -160,10 +160,11 @@ def get_dataset(
 
   # -- 1 ▸ Check if the dataset is already cached and tokenized --
   tok_tag = re.sub(r"[^a-zA-Z0-9]+", "-",  # make it filename-safe
-                   tokenizer.name_or_path.split("/")[-1])
+        tokenizer.name_or_path.split("/")[-1])
+  keys = [k for k in re.split(r"[,\s]+", subset_key) if k]
   filename = f"{dataset_name}"
   if subset_key is not None:
-    filename += f'_{subset_key}'
+    filename += "_"+"_".join(keys) if len(keys) > 0 else subset_key
     filename += f"_{mode}_bs{block_size}_{tok_tag}"
   filename += '_wrapped.dat' if wrap else '_unwrapped.dat'
   _path = os.path.join(cache_dir, filename)
@@ -319,9 +320,11 @@ def get_tokenizer(config):
   if config.data.tokenizer_name_or_path == 'bert-base-uncased':
     tokenizer = transformers.BertTokenizer.\
       from_pretrained('bert-base-uncased')
+    tokenizer.model_max_length = config.model.length
   else:
     tokenizer = transformers.AutoTokenizer.from_pretrained(
       config.data.tokenizer_name_or_path)
+
 
   if (isinstance(tokenizer, transformers.GPT2TokenizerFast)
       or isinstance(tokenizer, transformers.GPT2Tokenizer)):
@@ -419,6 +422,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
   else:
     if config.trainer.accelerator == 'cpu':
       from torch.utils.data import Subset
+      train_set_buffer = train_set
       train_set = Subset(train_set, indices=list(range(200)))
     train_loader = torch.utils.data.DataLoader(
       train_set,
@@ -440,6 +444,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       generator = torch.Generator().manual_seed(valid_seed)
     if config.trainer.accelerator == 'cpu':
         from torch.utils.data import Subset
+        valid_set_buffer = valid_set
         valid_set = Subset(valid_set, indices=list(range(200)))
     valid_loader = torch.utils.data.DataLoader(
       valid_set,
@@ -450,7 +455,10 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       generator=generator)
     # Will be used in generative perplexity calculation
     valid_loader.tokenizer = tokenizer
-
+  if config.trainer.accelerator == 'cpu':
+    pad_token = tokenizer.pad_token_id
+    print_number_of_tokens_and_samples(
+        train_set_buffer, valid_set_buffer, pad_token, subset_key=subset_key)
   return train_loader, valid_loader
 
 
@@ -600,3 +608,26 @@ def build_mixed_loader(src_loader, tgt_loader, cfg):
         collate_fn=src_loader.collate_fn,  # keep the same tokenizer collator
     )
 
+
+def print_number_of_tokens_and_samples(
+    train_set, valid_set, pad_id, subset_key=None):
+  from datasets import concatenate_datasets
+  if train_set is None or valid_set is None:
+        print("No train or validation set provided.")
+        return
+  if subset_key is None:
+        subset_key = "default"
+  both_sets = concatenate_datasets([train_set, valid_set])
+
+  print("We are using the following category for the train set: {}".format(subset_key))
+  print("The set has {} samples, but we will use only 200 for debugging.".format(len(both_sets)))
+  print("The set had {} number of tokens.".format(
+    sum(len(sample['input_ids']) for sample in both_sets)))
+  """
+  n_valid_tokens = sum(
+    (tok_id != pad_id)  # True → 1, False → 0
+    for sample in both_sets
+    for tok_id in sample["input_ids"]
+  )
+  print("The set had {} number of tokens without the padding token.".format(n_valid_tokens))
+  """
