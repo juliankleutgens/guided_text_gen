@@ -302,7 +302,7 @@ class Classifier(BaseDMModel):
     targets = y.float()
     if (not self.is_eval_classifier
         and getattr(self.config.training_classifier, 'use_label_smoothing', False)):
-      eps = getattr(self.config.training_classifier, 'label_smoothing_eps', 0.05)
+      eps = getattr(self.config.training_classifier, 'label_smoothing_eps', 0.1)
       targets = targets * (1 - eps) + (1 - targets) * eps
 
     # I have deleted the FUDGE implementation, since it is only useful for autoregressive models (https://arxiv.org/pdf/2104.05218)

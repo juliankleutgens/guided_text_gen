@@ -1,40 +1,38 @@
-name: mdlm
+name: text_gen_guided
 channels:
+  - conda-forge       # always first on FASRC
+  - nvidia            # for pytorch-cuda
   - pytorch
-  - anaconda
-  #- nvidia
-  - defaults
 dependencies:
-  #- cuda-nvcc=12.4.99
-  - jupyter=1.0.0
-  - pip=23.3.1
+  # core
   - python=3.9
-  #- pytorch-cuda=12.1
-  # ensure torch is present before pip
+  - pip
   - pytorch=2.2.2
   - torchvision=0.17.2
-  - cpuonly
+  - pytorch-cuda=12.1      # GPU
+  # tooling
+  - jupyterlab             # newer Jupyter front-end
+  - git-lfs
+  # extras pulled by conda where possible
+  - pandas=2.2.*
+  - seaborn=0.13.*
+  - scikit-learn=1.4.*
+  # everything else via pip
   - pip:
-      #- causal-conv1d==1.1.3.post1
       - datasets==2.18.0
       - einops==0.7.0
       - fsspec==2024.2.0
-      #- git-lfs==1.6
       - h5py==3.10.0
       - hydra-core==1.3.2
       - ipdb==0.13.13
       - lightning==2.2.1
-      #- mamba-ssm==1.1.4
-      - notebook==7.1.1
       - nvitop==1.3.2
       - omegaconf==2.3.0
       - packaging==23.2
-      - pandas==2.2.1
       - rich==13.7.1
-      - seaborn==0.13.2
-      - scikit-learn==1.4.0
       - timm==0.9.16
       - transformers==4.38.2
-      #- triton==2.2.0
       - wandb==0.13.5
-      #- flash-attn==2.5.6
+      # optional GPU-only builds
+      #- flash-attn==2.5.6      # GPU
+      ##- triton==2.2.0          # GPU

@@ -1,9 +1,9 @@
 train: arxiv_abstracts
 valid: arxiv_abstracts
 tokenizer_name_or_path: bert-base-uncased # gpt2
-path_to_data: /Users/juliankleutgens/arxiv-metadata-oai-snapshot.json # https://www.kaggle.com/datasets/Cornell-University/arxiv
+path_to_data: /n/home09/jkleutgens/guided_text_gen/data/arxiv-metadata-oai-snapshot.json # https://www.kaggle.com/datasets/Cornell-University/arxiv
 cache_dir: ~/hf_datasets_cache
 wrap: True
 streaming: False
-src_domain: stat #physics,cs,math,stat,quant-ph,hep-th,hep-ex,hep-lat,hep-ph,hep-phys
-tgt_domain: quant-ph #physics,cs,math,stat,quant-ph,hep-th,hep-ex,hep-lat,hep-ph,hep-phys
+src_domain: cs, math #physics,cs,math,stat,quant-ph,hep-th,hep-ex,hep-lat,hep-ph,hep-phys
+tgt_domain: physics #physics,cs,math,stat,quant-ph,hep-th,hep-ex,hep-lat,hep-ph,hep-phys

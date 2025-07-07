@@ -550,7 +550,6 @@ class Diffusion(BaseDMModel):
     p_x0_cache = None
 
     for i in range(num_steps):
-      print(i)
       t = timesteps[i] * torch.ones(
         x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm_cache':

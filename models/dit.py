@@ -120,7 +120,7 @@ def apply_rotary_pos_emb(qkv, cos, sin):
   sin = sin[0,:,0,0,:sin.shape[-1]//2]
   return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
 
-
+# ToDo: Check if that is correct!!
 def apply_rotary_pos_emb_for_macos(qkv, cos, sin):
   """
   qkv : (B, S, 3, H, D)
@@ -151,6 +151,27 @@ def apply_rotary_pos_emb_for_macos(qkv, cos, sin):
 
   q_rot, k_rot = _rot(q), _rot(k)
   return torch.stack([q_rot, k_rot, v], dim=2)  # (B, S, 3, H, D)
+
+def apply_rotary_pos_emb_for_macos_new(qkv, cos, sin):
+    # qkv: (B, S, 3, H, D)
+    cos = cos[0, :, 0, 0, :cos.shape[-1] // 2]      # (S, D/2)
+    sin = sin[0, :, 0, 0, :sin.shape[-1] // 2]
+
+    if has_flash:
+        return flash_attn.layers.rotary.apply_rotary_emb_qkv_(qkv, cos, sin)
+
+    cos = cos[None, :, None, :]                     # (1, S, 1, D/2)
+    sin = sin[None, :, None, :]
+
+    q, k, v = qkv.unbind(dim=2)                     # (B, S, H, D)
+
+    def rot(x):
+        x1, x2 = x[..., ::2], x[..., 1::2]
+        return torch.cat([x1 * cos - x2 * sin,
+                          x1 * sin + x2 * cos], dim=-1)
+
+    q_rot, k_rot = rot(q), rot(k)
+    return torch.stack([q_rot, k_rot, v], dim=2)    # (B, S, 3, H, D)
 
 
 # function overload
@@ -555,7 +576,7 @@ class DITRatio(nn.Module):
       self.sigma_map = TimestepEmbedder(config.ratio_model.cond_dim)
 
     self.rotary_emb = Rotary(
-      config.classifier_model.hidden_size // config.ratio_model.n_heads)
+      config.ratio_model.hidden_size // config.ratio_model.n_heads)
 
     blocks = []
     for _ in range(config.ratio_model.n_blocks):

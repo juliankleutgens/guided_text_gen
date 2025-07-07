@@ -1,3 +1,8 @@
 pretrained_model/
 outputs/
 __pycache__/
+data/
+.vscode/
+run_in_srun.sh
+__pycache__/dataloader.cpython-39.pyc
+.ipynb_checkpoints/

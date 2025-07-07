@@ -15,6 +15,7 @@ import diffusion
 import utils
 import classifier
 import ratio
+import datetime
 
 omegaconf.OmegaConf.register_new_resolver(
   'cwd', os.getcwd)
@@ -75,6 +76,16 @@ def _print_config(
         config.checkpointing.save_dir), 'w') as fp:
       rich.print(tree, file=fp)
 
+def set_up_wandb_logger_for_clf_or_ratio_model(cfg, model_type='ti_cls'):
+  run_name = cfg.wandb.name
+  cfg.wandb.name = f"{run_name}_{model_type}"
+  wandb_kwargs = {
+    "config": omegaconf.OmegaConf.to_object(cfg),
+    **cfg.wandb,
+    }
+  wandb_logger = L.pytorch.loggers.WandbLogger(**wandb_kwargs)
+  cfg.wandb.name = run_name  # Reset the name for future runs
+  return wandb_logger
 
 @L.pytorch.utilities.rank_zero_only
 def _print_batch(train_ds, valid_ds, tokenizer, k=64):
@@ -104,13 +115,13 @@ def _get_resume_ckpt(cfg: DictConfig) -> typing.Union[str, None]:
     return None
 
 
-def _make_trainer(cfg: DictConfig, callbacks: list, wandb_logger):
+def _make_trainer(cfg_trainer: DictConfig, cfg_strategy: DictConfig, callbacks: list, wandb_logger):
     """Instantiate a Lightning trainer from a Hydra config section."""
     return hydra.utils.instantiate(
-        cfg.trainer,
+        cfg_trainer,
         default_root_dir=os.getcwd(),
         callbacks=callbacks,
-        strategy=hydra.utils.instantiate(cfg.get("strategy")),
+        strategy=hydra.utils.instantiate(cfg_strategy),
         logger=wandb_logger,
     )
 
@@ -123,7 +134,7 @@ def train_diffusion_model(cfg: DictConfig, callbacks: list, wandb_logger, tokeni
     train_ds, valid_ds = dataloader.get_dataloaders(cfg, tokenizer, domain="src")
 
     model = diffusion.Diffusion(cfg, tokenizer=valid_ds.tokenizer)
-    trainer = _make_trainer(cfg, callbacks, wandb_logger)
+    trainer = _make_trainer(cfg.trainer,cfg.get("strategy"),  callbacks, wandb_logger)
 
     trainer.fit(model, train_ds, valid_ds, ckpt_path=_get_resume_ckpt(cfg))
 
@@ -144,18 +155,21 @@ def _build_and_maybe_train_classifier(*, cfg: DictConfig, tokenizer, train_time_
             train_time_independent=train_time_independent,
         ),
         section_cfg.ckpt_path,
-        section_cfg.retrain_when_loaded,
+        not section_cfg.retrain_when_loaded,
     )
 
+    trainer = cfg.trainer_ti if train_time_independent else cfg.trainer_td
     if (not loaded) or section_cfg.retrain_when_loaded:
         train_loader, valid_loader = loader_pair
-        trainer = _make_trainer(cfg, utils._callbacks_for(name, cfg.checkpointing.save_dir, callbacks, cfg.training_classifier.val_metric_for_best_model), wandb_logger)
+        trainer = _make_trainer(trainer,cfg.get("strategy"), utils._callbacks_for(name, cfg.checkpointing.save_dir, callbacks, cfg.training_classifier.val_metric_for_best_model), wandb_logger)
         trainer.fit(cls, train_loader, valid_loader, ckpt_path=section_cfg.ckpt_path or None)
+        wandb_logger.experiment.finish()   
     return cls
 
 
 def train_classifier_models(cfg: DictConfig, callbacks: list, wandb_logger, tokenizer, train_loader, valid_loader):
     """Train / load both time‑independent and time‑dependent classifiers."""
+    wandb_logger_ti = set_up_wandb_logger_for_clf_or_ratio_model(cfg, model_type='ti_cls')
     cls_ti = _build_and_maybe_train_classifier(
         cfg=cfg,
         tokenizer=tokenizer,
@@ -165,8 +179,9 @@ def train_classifier_models(cfg: DictConfig, callbacks: list, wandb_logger, toke
         trainer_cfg=cfg.trainer_ti,
         name="ti_classifier",
         callbacks=callbacks,
-        wandb_logger=wandb_logger,
+        wandb_logger=wandb_logger_ti,
     )
+    wandb_logger_td = set_up_wandb_logger_for_clf_or_ratio_model(cfg, model_type='td_cls')
     cls_td = _build_and_maybe_train_classifier(
         cfg=cfg,
         tokenizer=tokenizer,
@@ -176,7 +191,7 @@ def train_classifier_models(cfg: DictConfig, callbacks: list, wandb_logger, toke
         trainer_cfg=cfg.trainer_td,
         name="td_classifier",
         callbacks=callbacks,
-        wandb_logger=wandb_logger,
+        wandb_logger=wandb_logger_td,
     )
     return cls_ti, cls_td
 
@@ -184,7 +199,6 @@ def train_classifier_models(cfg: DictConfig, callbacks: list, wandb_logger, toke
 # -----------------------------------------------------------------------------
 # Ratio training pipeline
 # -----------------------------------------------------------------------------
-
 def train_ratio_pipeline(cfg: DictConfig, callbacks: list, wandb_logger, tokenizer):
     """Full pipeline for training source/target classifiers and the ratio model."""
 
@@ -209,24 +223,27 @@ def train_ratio_pipeline(cfg: DictConfig, callbacks: list, wandb_logger, tokeniz
     )
 
     ratio_net, loaded_ratio = utils.build_or_load(
-        ratio.RatioEstimator,
-        dict(
+        model_cls=ratio.RatioEstimator,
+        init_kwargs=dict(
             config=cfg,
             tokenizer=train_ds_src.tokenizer,
             domain_classifier=cls_ti,
             domain_classifier_time_dependent=cls_td,
         ),
-        cfg.ratio_model.ckpt_path,
-        cfg.ratio_model.retrain_when_loaded,
+        ckpt_path=cfg.ratio_model.ckpt_path,
+        freeze= not cfg.ratio_model.retrain_when_loaded,
     )
 
     if (not loaded_ratio) or cfg.ratio_model.retrain_when_loaded:
+        wandb_ratio = set_up_wandb_logger_for_clf_or_ratio_model(cfg, model_type='ratio_model')
         trainer = _make_trainer(
-            cfg,
+            cfg.trainer_ratio,
+            cfg.get("strategy"),
             utils._callbacks_for("ratio_model", cfg.checkpointing.save_dir, callbacks, cfg.training_ratio.val_metric_for_best_model),
             wandb_logger,
         )
         trainer.fit(ratio_net, paired_train, paired_valid, ckpt_path=cfg.ratio_model.ckpt_path or None)
+        wandb_logger.experiment.finish()   
 
 
 # -----------------------------------------------------------------------------
@@ -290,6 +307,27 @@ def _ppl_eval(config, logger, tokenizer):
     config, tokenizer, skip_train=True, valid_seed=config.seed)
   trainer.validate(model, valid_ds)
 
+def change_config_if_debugging(config):
+  """Change the config for debugging purposes."""
+  if config.get("debug", False):
+    config.wandb.name = f"debug_{config.wandb.name}"
+    config.trainer.max_steps = 40
+    config.trainer_ti.max_steps = 20
+    config.trainer_ti.val_check_interval = 1.0
+    config.trainer_td.max_steps = 30
+    config.trainer_td.val_check_interval = 1.0
+    config.trainer.val_check_interval = 1.0
+    config.trainer_ratio.max_steps = 25
+    config.trainer_ratio.val_check_interval = 1.0
+    config.eval.disable_ema = True
+    config.sampling.steps = 10
+    config.sampling.num_sample_batches = 1
+    config.loader.persistent_workers = False
+    config.trainer.precision = "bf16-mixed"
+    config
+    if config.mode == "train":
+      config.loader.batch_size = 16
+  return config
 
 # -----------------------------------------------------------------------------
 # Main entry point
@@ -298,6 +336,8 @@ def _ppl_eval(config, logger, tokenizer):
 def main(cfg: DictConfig) -> None:
     """Dispatch to the appropriate training or evaluation routine."""
     L.seed_everything(cfg.seed)
+    config = change_config_if_debugging(cfg)
+
     _print_config(cfg, resolve=True, save_cfg=True)
      # e.g. 1024 or 512
 
@@ -307,11 +347,13 @@ def main(cfg: DictConfig) -> None:
     # Setup logging
     wandb_logger = None
     if cfg.get("wandb") is not None:
+        run_name = f"{cfg.wandb.name}_experiment_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        cfg.wandb.name = run_name
         wandb_kwargs = {
             "config": omegaconf.OmegaConf.to_object(cfg),
             **cfg.wandb,
         }
-        wandb_logger = L.pytorch.loggers.WandbLogger(**wandb_kwargs)
+        wandb_logger = L.pytorch.loggers.WandbLogger(**wandb_kwargs) 
 
     callbacks = []
     if "callbacks" in cfg:

@@ -200,7 +200,8 @@ def get_dataset(
         split="train",
         streaming=False
       )
-      dataset_filtered = filter_arxiv_dataset_by_domain(ds, subset_key)
+      dataset_filtered = filter_arxiv_dataset_by_domain(ds, keys)
+      print(f"The dataset is completly empty: {len(dataset_filtered)}")
       dataset = dataset_filtered.train_test_split(test_size=0.1, seed=42)
   elif dataset_name == 'scientific_papers_pubmed':
     dataset = datasets.load_dataset(
@@ -282,6 +283,8 @@ def get_dataset(
       preprocess_and_tokenize,
       batched=True,
       desc='Tokenizing')
+    print("1")
+    print(tokenized_dataset)
   else:
     tokenized_dataset = data.map(
       preprocess_and_tokenize,
@@ -290,6 +293,8 @@ def get_dataset(
       #batch_size=1000,
       load_from_cache_file=True,
       desc='Tokenizing')
+    print("2")
+    print(tokenized_dataset)
 
   tokenized_dataset = tokenized_dataset.select_columns("input_ids")
 
@@ -420,17 +425,18 @@ def get_dataloaders(config, tokenizer, skip_train=False,
   if skip_train:
     train_loader = None
   else:
-    if config.trainer.accelerator == 'cpu':
+    train_set_buffer = train_set
+    if False and (config.trainer.accelerator == 'cpu' or config.get("debug", False)):
       from torch.utils.data import Subset
-      train_set_buffer = train_set
-      train_set = Subset(train_set, indices=list(range(200)))
+      train_set = Subset(train_set, indices=list(range(500)))
+    pw = config.loader.persistent_workers and config.loader.num_workers > 0
     train_loader = torch.utils.data.DataLoader(
       train_set,
       batch_size=config.loader.batch_size,
       num_workers=config.loader.num_workers,
       pin_memory=config.loader.pin_memory,
       shuffle=not config.data.streaming,
-      persistent_workers=True)
+      persistent_workers=pw,)
     train_loader.tokenizer = tokenizer
 
   if skip_valid:
@@ -442,10 +448,11 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     else:
       shuffle_valid = True
       generator = torch.Generator().manual_seed(valid_seed)
-    if config.trainer.accelerator == 'cpu':
+
+    valid_set_buffer = valid_set
+    if False and (config.trainer.accelerator == 'cpu' or config.get("debug", False)):
         from torch.utils.data import Subset
-        valid_set_buffer = valid_set
-        valid_set = Subset(valid_set, indices=list(range(200)))
+        valid_set = Subset(valid_set, indices=list(range(500)))
     valid_loader = torch.utils.data.DataLoader(
       valid_set,
       batch_size=config.loader.eval_batch_size,
@@ -455,10 +462,11 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       generator=generator)
     # Will be used in generative perplexity calculation
     valid_loader.tokenizer = tokenizer
-  if config.trainer.accelerator == 'cpu':
-    pad_token = tokenizer.pad_token_id
-    print_number_of_tokens_and_samples(
+
+  pad_token = tokenizer.pad_token_id
+  print_number_of_tokens_and_samples(
         train_set_buffer, valid_set_buffer, pad_token, subset_key=subset_key)
+
   return train_loader, valid_loader
 
 
@@ -590,22 +598,22 @@ class DomainLabeledDataset(torch.utils.data.Dataset):
 
 def build_mixed_loader(src_loader, tgt_loader, cfg):
     """
-    Concatenate the two datasets, add domain labels (1=src, 0=tgt),
+    Concatenate the two datasets, add domain labels (1 = src, 0 = tgt),
     and return one shuffled DataLoader.
     """
-
     mixed_ds = ConcatDataset([
         DomainLabeledDataset(src_loader.dataset, 1),
         DomainLabeledDataset(tgt_loader.dataset, 0)
     ])
+
     return DataLoader(
         mixed_ds,
-        batch_size=cfg.loader.batch_size,
-        shuffle=True,
-        num_workers=cfg.loader.num_workers,
-        pin_memory=cfg.loader.pin_memory,
-        persistent_workers=src_loader.persistent_workers,
-        collate_fn=src_loader.collate_fn,  # keep the same tokenizer collator
+        batch_size       = cfg.loader.batch_size,
+        shuffle          = True,
+        num_workers      = cfg.loader.num_workers,
+        pin_memory       = False,                               # ← keep GPU calls out of workers
+        persistent_workers = (cfg.loader.persistent_workers and cfg.loader.num_workers > 0),
+        collate_fn       = src_loader.collate_fn,               # reuse the tokenizer collator
     )
 
 
@@ -620,7 +628,7 @@ def print_number_of_tokens_and_samples(
   both_sets = concatenate_datasets([train_set, valid_set])
 
   print("We are using the following category for the train set: {}".format(subset_key))
-  print("The set has {} samples, but we will use only 200 for debugging.".format(len(both_sets)))
+  print("The set has {} samples.".format(len(both_sets)))
   print("The set had {} number of tokens.".format(
     sum(len(sample['input_ids']) for sample in both_sets)))
   """

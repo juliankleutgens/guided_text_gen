@@ -24,12 +24,13 @@ parameterization: subs                   # options: subs | d3pm | sedd
 time_conditioning: true                  # if true, σₜ is passed into backbone
 T: 0                                     # 0 = continuous time, 1000 = discrete steps
 subs_masking: false                      # true: mask‑only (MLDM) | false: full substitution (D3PM)
+debug: false                             # true: only 10 steps for training and only 200 Samples, for debugging 
 
 # =====================
 #  Data Loading
 # =====================
 loader:
-  global_batch_size: 64
+  global_batch_size: 128            # global batch size, i.e., per accelerator
   eval_global_batch_size: ${.global_batch_size}
 
   # batch_size and eval_batch_size are **per machine**
@@ -37,7 +38,7 @@ loader:
   eval_batch_size: ${div_up:${.eval_global_batch_size}, ${eval:${trainer.devices} * ${trainer.num_nodes}}}
 
   num_workers: ${eval:"len(__import__('os').sched_getaffinity(0))"}
-  pin_memory: true
+  pin_memory: false
   persistent_workers: true
 
 # =====================
@@ -102,41 +103,41 @@ optim:
 # =====================
 trainer: &base_trainer
   _target_: lightning.Trainer
-  accelerator: cpu
+  accelerator: cuda
   num_nodes: 1
   devices: ${device_count:}
   accumulate_grad_batches: ${div_up:${loader.global_batch_size}, ${eval:${trainer.devices} * ${loader.batch_size} * ${trainer.num_nodes}}}
   gradient_clip_val: 1.0
-  precision: '32'                      # 'bf16' for mixed precision
-  num_sanity_val_steps: 1
-  max_steps: 20                        # default: 1_000_000
+  precision: 'bf16-mixed'                      # 'bf16' or '32-true' for mixed precision
+  num_sanity_val_steps: 2
+  max_steps: 50_000                        # default: 1_000_000
   log_every_n_steps: 10
   limit_train_batches: 1.0             # 1.0 = full dataset
   limit_val_batches: 1.0               # 1.0 = full dataset
-  val_check_interval: 1.0              # every epoch
+  val_check_interval: 0.5              # every ... epoch if <= 1.0, or every ... steps if > 1.0
 
 # Trainers for different tasks
 trainer_ti:
   <<: *base_trainer
-  max_steps: 20
+  max_steps: 2_000
 
 trainer_td:
   <<: *base_trainer
-  max_steps: 20
+  max_steps: 2_000
 
 trainer_ratio:
   <<: *base_trainer
-  max_steps: 5
+  max_steps: 30_000
 
 # =====================
 #  Model checkpoints
 # =====================
 classifier_ti:
-  ckpt_path: "/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/ti_classifier/checkpoints/best.ckpt"                        # leave blank to train from scratch
-  retrain_when_loaded: false           # just use it, don't train
+  ckpt_path: ""
+  retrain_when_loaded: true           # just use it, don't train
 
 classifier_td:
-  ckpt_path: "/Users/juliankleutgens/PycharmProjects/mdlm-master/pretrained_model/td_classifier/checkpoints/last.ckpt"                        # leave blank to train from scratch
+  ckpt_path: ""                        # leave blank to train from scratch
   retrain_when_loaded: false           # just use it, don't train
 
 ratio_model:
@@ -148,7 +149,7 @@ ratio_model:
 # =====================
 wandb:
   project: text-diffusion
-  notes: Mulan for text
+  notes: training
   group: null
   job_type: null
   name: null
@@ -163,7 +164,7 @@ wandb:
 # =====================
 hydra:
   run:
-    dir: ./outputs/${data.train}/${now:%Y.%m.%d}/${now:%H%M%S}
+    dir: ./outputs/${data.train}/${mode}/${now:%Y.%m.%d}/${now:%H%M%S}_${eval:"f'{__import__(\"random\").randint(0,9999):04d}'"}
   job:
     chdir: true
 

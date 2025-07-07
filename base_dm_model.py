@@ -121,6 +121,7 @@ class BaseDMModel(L.LightningModule):
                     'epoch': self.fast_forward_epochs,
                     'counter': (self.fast_forward_batches
                                 * self.config.loader.batch_size)})
+            pw = self.config.loader.persistent_workers and self.config.loader.num_workers > 0
             updated_dls.append(
                 torch.utils.data.DataLoader(
                     dl.dataset,
@@ -129,7 +130,7 @@ class BaseDMModel(L.LightningModule):
                     pin_memory=self.config.loader.pin_memory,
                     sampler=dl_sampler,
                     shuffle=False,
-                    persistent_workers=True))
+                    persistent_workers=pw))
         self.trainer.fit_loop._combined_loader.flattened = updated_dls
 
     # ---------- corruption helpers -----------------------------------------
