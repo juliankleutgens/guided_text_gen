@@ -6,3 +6,5 @@ data/
 run_in_srun.sh
 __pycache__/dataloader.cpython-39.pyc
 .ipynb_checkpoints/
+configs_mdlm/
+main_mldm.py

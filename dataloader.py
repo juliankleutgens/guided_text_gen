@@ -161,7 +161,7 @@ def get_dataset(
   # -- 1 ▸ Check if the dataset is already cached and tokenized --
   tok_tag = re.sub(r"[^a-zA-Z0-9]+", "-",  # make it filename-safe
         tokenizer.name_or_path.split("/")[-1])
-  keys = [k for k in re.split(r"[,\s]+", subset_key) if k]
+  keys = [k for k in re.split(r"[,\s]+", subset_key) if k] if subset_key else ["whole dataset"]
   filename = f"{dataset_name}"
   if subset_key is not None:
     filename += "_"+"_".join(keys) if len(keys) > 0 else subset_key
@@ -231,6 +231,8 @@ def get_dataset(
     detokenizer = wt_detokenizer
   elif dataset_name == 'lambada':
     detokenizer = lambada_detokenizer
+  elif dataset_name == 'lm1b':
+    detokenizer = lm1b_detokenizer
   elif dataset_name.startswith('scientific_papers'):
     detokenizer = scientific_papers_detokenizer
   else:
@@ -629,8 +631,7 @@ def print_number_of_tokens_and_samples(
 
   print("We are using the following category for the train set: {}".format(subset_key))
   print("The set has {} samples.".format(len(both_sets)))
-  print("The set had {} number of tokens.".format(
-    sum(len(sample['input_ids']) for sample in both_sets)))
+  #print("The set had {} number of tokens.".format(sum(len(sample['input_ids']) for sample in both_sets)))
   """
   n_valid_tokens = sum(
     (tok_id != pad_id)  # True → 1, False → 0

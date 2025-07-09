@@ -1,0 +1,11 @@
+name: macro
+type: ddit
+hidden_size: 256
+cond_dim: 128
+length: ${model.length}  # Same length as diffusion model
+n_blocks: 4
+n_heads: 4
+scale_by_sigma: True
+dropout: 0.1
+num_classes: 2
+pooling: mean

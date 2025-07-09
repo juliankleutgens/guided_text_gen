@@ -6,7 +6,7 @@ defaults:
   - /model: small
   - /strategy: ddp
   - /noise: loglinear
-  - /lr_scheduler: constant_warmup
+  - /lr_scheduler: cosine_decay_warmup
   - /classifier_model: tiny-classifier   # options: small | tiny
   - /ratio_model: tiny-ratio             # options: small | tiny
   - /guidance: null
@@ -67,6 +67,7 @@ training: &base_training
 training_classifier:
   <<: *base_training
   use_label_smoothing: true
+  label_smoothing_eps: 0.1
   val_metric_for_best_model: cross_entropy   # options: gen_ppl | cross_entropy | total
 
 training_ratio:
@@ -93,7 +94,7 @@ eval:
 # =====================
 optim:
   weight_decay: 0
-  lr: 3e-4
+  lr: 3e-5
   beta1: 0.9
   beta2: 0.999
   eps: 1e-8
@@ -134,7 +135,7 @@ trainer_ratio:
 # =====================
 classifier_ti:
   ckpt_path: ""
-  retrain_when_loaded: true           # just use it, don't train
+  retrain_when_loaded: false           # just use it, don't train
 
 classifier_td:
   ckpt_path: ""                        # leave blank to train from scratch
@@ -164,7 +165,7 @@ wandb:
 # =====================
 hydra:
   run:
-    dir: ./outputs/${data.train}/${mode}/${now:%Y.%m.%d}/${now:%H%M%S}_${eval:"f'{__import__(\"random\").randint(0,9999):04d}'"}
+    dir: ./outputs/${data.train}/${mode}/${now:%Y.%m.%d}/${now:%H%M%S}_${wandb.name}    #${eval:"f'{__import__(\"random\").randint(0,9999):04d}'"}
   job:
     chdir: true
 

@@ -163,7 +163,15 @@ def _build_and_maybe_train_classifier(*, cfg: DictConfig, tokenizer, train_time_
         train_loader, valid_loader = loader_pair
         trainer = _make_trainer(trainer,cfg.get("strategy"), utils._callbacks_for(name, cfg.checkpointing.save_dir, callbacks, cfg.training_classifier.val_metric_for_best_model), wandb_logger)
         trainer.fit(cls, train_loader, valid_loader, ckpt_path=section_cfg.ckpt_path or None)
+
+        # tidy-up the wandb logger and the trainer
         wandb_logger.experiment.finish()   
+        cls.eval().cpu()          # keep object, free GPU memory
+        trainer.strategy.teardown() # shuts down NCCL pg + workers
+        del trainer                 # drop last refs
+        torch.cuda.empty_cache()    # optional but nice
+    else:
+        print(f"The classifier {name} was loaded from {section_cfg.ckpt_path}.")
     return cls
 
 
@@ -311,20 +319,24 @@ def change_config_if_debugging(config):
   """Change the config for debugging purposes."""
   if config.get("debug", False):
     config.wandb.name = f"debug_{config.wandb.name}"
-    config.trainer.max_steps = 40
+    config.trainer.max_steps = 100_000
+    config.trainer.limit_train_batches=0.001
+    config.trainer.limit_val_batches=0.001
     config.trainer_ti.max_steps = 20
-    config.trainer_ti.val_check_interval = 1.0
+    config.trainer_ti.val_check_interval = 4
     config.trainer_td.max_steps = 30
     config.trainer_td.val_check_interval = 1.0
-    config.trainer.val_check_interval = 1.0
+    config.trainer.val_check_interval = 0.5
     config.trainer_ratio.max_steps = 25
     config.trainer_ratio.val_check_interval = 1.0
+    config.trainer.val_check_interval=2
     config.eval.disable_ema = True
     config.sampling.steps = 10
     config.sampling.num_sample_batches = 1
+    config.loader.global_batch_size = 16
+    config.trainer.accumulate_grad_batches=1
     config.loader.persistent_workers = False
     config.trainer.precision = "bf16-mixed"
-    config
     if config.mode == "train":
       config.loader.batch_size = 16
   return config

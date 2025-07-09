@@ -299,11 +299,16 @@ class Diffusion(BaseDMModel):
 
   def training_step(self, batch, batch_idx):
     loss = self._compute_loss(batch, prefix='train')
+    x_clean_text = self.tokenizer.batch_decode(batch['input_ids'], skip_special_tokens=True)
+    perplexity_of_clean_text = self.get_generative_perplexity(
+      x_clean_text, retokenize=True,
+      max_length=self.config.model.length)
     self.log(name='trainer/loss',
              value=loss.item(),
              on_step=True,
              on_epoch=False,
              sync_dist=True)
+    self.de
     return loss
 
   def on_validation_epoch_start(self):
@@ -329,15 +334,15 @@ class Diffusion(BaseDMModel):
          and not self.parameterization == 'ar'):
       # TODO(justin): implement sampling and kv cache for AR
       samples, text_samples = None, None
-      for _ in range(
-        1):#self.config.sampling.num_sample_batches):
+      torch.cuda.empty_cache()          
+      torch.cuda.reset_peak_memory_stats()
+      for _ in range(1):#self.config.sampling.num_sample_batches):
         samples = self._sample()
         # Decode the samples to be re-tokenized by eval model
         text_samples = self.tokenizer.batch_decode(samples)
         if self.config.eval.compute_generative_perplexity:
           self.compute_generative_perplexity(text_samples)
-      if self.trainer.global_rank == 0 and hasattr(
-        self.trainer.logger, 'log_table'):
+      if self.trainer.global_rank == 0 and hasattr(self.trainer.logger, 'log_table'):
         # Log the last generated samples
         text_samples = text_samples[
           : self.config.sampling.num_sample_log]
@@ -457,6 +462,7 @@ class Diffusion(BaseDMModel):
       samples.shape[0])
     num_batches = samples.shape[0] // batch_size
     for i in range(num_batches):
+      # Splite the generated sample size into smaller sub batches  
       _samples = torch.split(
         samples[i * batch_size: (i + 1) * batch_size],
         eval_context_size,
@@ -550,13 +556,11 @@ class Diffusion(BaseDMModel):
     p_x0_cache = None
 
     for i in range(num_steps):
-      t = timesteps[i] * torch.ones(
-        x.shape[0], 1, device=self.device)
+      t = timesteps[i] * torch.ones(x.shape[0], 1, device=self.device)
       if self.sampler == 'ddpm_cache':
         p_x0_cache, x_next = self._ddpm_caching_update(
           x, t, dt, p_x0=p_x0_cache)
-        if (not torch.allclose(x_next, x)
-            or self.time_conditioning):
+        if (not torch.allclose(x_next, x) or self.time_conditioning):
           # Disable caching
           p_x0_cache = None
         x = x_next
@@ -597,26 +601,7 @@ class Diffusion(BaseDMModel):
 
   def get_score(self, x, sigma):
     model_output = self.forward(x, sigma)
-    if self.parameterization == 'subs':
-      # score(x, t) = p_t(y) / p_t(x)
-      # => log score(x, t) = log p_t(y) - log p_t(x)
-      
-      # case 1: x = masked
-      #   (i) y = unmasked
-      #     log score(x, t) = log p_\theta(x)|_y + log k
-      #     where k = exp(- sigma) / (1 - exp(- sigma))
-      #   (ii) y = masked
-      #     log score(x, t) = 0
-
-      # case 2: x = unmasked
-      #   (i) y != masked, y != x
-      #     log score(x_i, t) = - inf
-      #   (ii) y = x 
-      #     log score(x_i, t) = 0
-      #   (iii) y = masked token
-      #     log score(x_i, t) = - log k
-      #     where k = exp(- sigma) / (1 - exp(- sigma))
-      
+    if self.parameterization == 'subs':     
       log_k = - torch.log(torch.expm1(sigma)).squeeze(-1)
       assert log_k.ndim == 1
       
@@ -765,12 +750,7 @@ class Diffusion(BaseDMModel):
      attention_mask) = self._maybe_sub_sample(
        x0, attention_mask)
 
-    if self.parameterization == 'ar':
-      logprobs = self.backbone(input_tokens, None)
-      loss = - logprobs.gather(
-        -1, output_tokens[:, :, None])[:, :, 0]
-    else:
-      loss = self._forward_pass_diffusion(input_tokens)
+    loss = self._forward_pass_diffusion(input_tokens)
     
     nlls = loss * attention_mask
     count = attention_mask.sum()
@@ -939,3 +919,108 @@ class Diffusion(BaseDMModel):
       xs = torch.where(copy_flag.to(bool), xt, xs)
     return xs, guided_probs, {'log_x_theta': log_x_theta,
                               'classifier_log_prob': classifier_log_prob}
+  def detokenize_batch(x0: torch.Tensor, tokenizer, *, skip_special_tokens: bool = True):
+      """
+      How to use:
+      texts = self.detokenize_batch(x0, self.tokenizer)
+
+      for i, txt in enumerate(texts[:3]):   # show first few examples
+        print(f"[sample {i}] {txt}")
+      """
+
+      input_ids = x0.detach().cpu().tolist()
+      return tokenizer.batch_decode(input_ids, skip_special_tokens=skip_special_tokens)
+    
+  def get_generative_perplexity(
+    self,
+    text_samples: typing.List[str],
+    *,
+    retokenize: bool = True,
+    max_length: typing.Optional[int] = None,
+) -> float:
+    """
+    Score a batch of generated texts with a frozen AR language model
+    (GPT-2 by default) and return their average generative perplexity.
+
+    Args
+    ----
+    text_samples : list[str]
+        Sentences produced by your diffusion model.
+    retokenize : bool, default=True
+        If True, detokenise the strings with `eval_model_tokenizer`
+        before scoring.  If you already pass `input_ids`, set False.
+    max_length : int or None
+        Truncation / padding length for the scorer model tokenizer.
+        Defaults to `self.config.model.length`.
+
+    Returns
+    -------
+    float
+        exp( mean NLL ) computed under the evaluator LM.
+    """
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
+
+    # -------- 1. load the evaluator LM (e.g. GPT-2) -----------------
+    scorer_name = self.gen_ppl_eval_model_name_or_path
+    eval_model = (
+        transformers.AutoModelForCausalLM.from_pretrained(scorer_name)
+        .eval()
+    )
+
+    # Put on the same device as this module unless it's an HF Llama-2
+    if "llama2" not in scorer_name:
+        eval_model = eval_model.to(self.device)
+
+    # -------- 2. (re-)tokenise the generated strings ----------------
+    if max_length is None:
+        max_length = self.config.model.length
+
+    if retokenize:
+        samples, attn_mask, eval_ctx = self.eval_retokenize(
+            text_samples, max_length=max_length
+        )
+    else:
+        # already tokenised
+        samples = text_samples
+        attn_mask = torch.ones_like(samples, device=self.device)
+        eval_ctx = samples.shape[-1]
+
+    # -------- 3. compute running totals of NLL & token count --------
+    batch_sz = min(
+        self.config.eval.perplexity_batch_size, samples.shape[0]
+    )
+    n_batches = math.ceil(samples.shape[0] / batch_sz)
+
+    total_nll = 0.0
+    total_tokens = 0.0
+    eos_id = self.eval_model_tokenizer.eos_token_id
+    # Split large sequences so they never exceed the scorer’s context window
+    for i in range(n_batches):
+        chunk_ids = samples[i * batch_sz : (i + 1) * batch_sz]
+        chunk_mask = attn_mask[i * batch_sz : (i + 1) * batch_sz]
+
+        id_splits = torch.split(chunk_ids, eval_ctx, dim=-1)
+        mask_splits = torch.split(chunk_mask, eval_ctx, dim=-1)
+
+        for ids, msk in zip(id_splits, mask_splits):
+            logits = eval_model(ids.to(eval_model.device),attention_mask=msk.to(eval_model.device)).logits  # (B, L, V)
+            logits = logits.transpose(1, 2)               # (B, V, L)
+
+            # Cross-entropy for every *predict-next-token* position
+            nll = F.cross_entropy(
+                logits[..., :-1],       # (B, V, L-1)
+                ids[..., 1:],           # (B,     L-1)
+                reduction="none",
+            )
+
+            # Mask = all non-<eos> tokens + the *first* <eos>
+            first_eos = (ids == eos_id).cumsum(-1) == 1
+            keep_mask = (ids != eos_id)
+            mask = (first_eos | keep_mask)[..., 1:]  # align with nll
+
+            total_nll += (nll * mask).sum().item()
+            total_tokens += mask.sum().item()
+
+    # -------- 4. convert mean NLL to perplexity ----------------------
+    ppl = math.exp(total_nll / max(total_tokens, 1e-8))
+    return ppl

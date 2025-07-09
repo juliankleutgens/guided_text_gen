@@ -56,9 +56,7 @@ class RatioEstimator(BaseDMModel):
         # --------------------------------------------------
         # 4 ▸ Frozen auxiliary classifiers
         self.domain_classifier = domain_classifier.eval().requires_grad_(False)
-        self.domain_classifier_t = (
-            domain_classifier_time_dependent.eval().requires_grad_(False)
-        )
+        self.domain_classifier_t = domain_classifier_time_dependent.eval().requires_grad_(False)
 
         # --------------------------------------------------
         # 5 ▸ Ratio‑network backbone
@@ -99,6 +97,37 @@ class RatioEstimator(BaseDMModel):
         with torch.cuda.amp.autocast(dtype=torch.float32):
             logits = self.ratio_model(x_t, sigma, x_emb=x_emb, attention_mask=attention_mask)
         return logits
+    
+    # ================================================================
+    # ▸ util classifiers forward
+    def _frozen_clf_forward(self, model, *tensors, **kwargs):
+        """
+        Run an auxiliary classifier that lives on the CPU.
+        - moves inputs to CPU
+        - executes under torch.no_grad()
+        - moves output back to the training device
+        """
+        tensors_cpu = [t.cpu() for t in tensors]
+        kwargs_cpu  = {k: v.cpu() for k, v in kwargs.items()}
+        with torch.no_grad():
+            out = model(*tensors_cpu, **kwargs_cpu)
+        return out.to(self.device)            # back to GPU for later math
+    
+    def _cpu_forward(self, model: nn.Module, *args, **kwargs):
+        """Run a frozen model that is kept on CPU and moves all tensor inputs to CPU"""
+        def to_cpu(x):
+            return x.cpu() if torch.is_tensor(x) else x
+        args_cpu  = [to_cpu(a) for a in args]
+        kwargs_cpu = {k: to_cpu(v) for k, v in kwargs.items()}
+
+        prev_device = getattr(model, "device", None)
+        if prev_device is not None:
+            model.device = torch.device("cpu")
+            print(f"Moved model {model.__class__.__name__} to CPU for inference.")
+        with torch.no_grad():
+            out = model(*args_cpu, **kwargs_cpu)
+
+        return out.to(self.device)            # so the rest of the graph is on GPU
 
     # ================================================================
     # ▸ core loss computation

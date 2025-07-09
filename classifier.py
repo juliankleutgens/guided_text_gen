@@ -191,6 +191,11 @@ class Classifier(BaseDMModel):
               vocab_size=self.vocab_size,
               time_conditioning=not train_time_independent,
           )
+          """
+          for name, module in self.classifier_model.named_modules():
+            if isinstance(module, torch.nn.Dropout):
+              print(f"{name}: p={module.p}")
+          """
       else:
           raise NotImplementedError(
               f"Classifier backbone {config.classifier_backbone} not implemented."
@@ -232,7 +237,7 @@ class Classifier(BaseDMModel):
       if hasattr(logits, 'logits'):
         logits = logits.logits
     else:
-      sigma = self._process_sigma(sigma) if sigma is not None else sigma
+      sigma = self._process_sigma(sigma) if sigma is not None or not self.train_time_independent else sigma
       with torch.cuda.amp.autocast(dtype=torch.float32):
         logits = self.classifier_model(x, sigma, x_emb=x_emb, attention_mask=attention_mask)
     return logits
@@ -288,22 +293,28 @@ class Classifier(BaseDMModel):
     # get the output logits
     if self.is_eval_classifier:
       logits = self.forward(x0)
-    elif self.train_time_independent:
-      logits = self.forward(x0, attention_mask=attention_mask)
-    else:
-      t = self._sample_t(x0.shape[0])
-      time_conditioning, move_chance = self._get_time_conditioning_and_move_chance(t)
-      xt = self._q_xt(x0, move_chance)
-      # time conditioning is sigma when change_of_variables is False, else it is t
-      logits = self.forward(xt, time_conditioning, attention_mask=attention_mask)
+    elif not self.train_time_independent:
+        t = self._sample_t(x0.size(0))
+        time_cond, move_chance = self._get_time_conditioning_and_move_chance(t)
+        x_in = self._q_xt(x0, move_chance)
+        logits = self.forward(x_in, time_cond, attention_mask=attention_mask)
+    else:                     # clean input for val / test in time dependent case
+        logits = self.forward(x0, attention_mask=attention_mask)
 
 
     # Optional label‑smoothing handled by PyTorch (for multi‑class) or manual (for single‑logit binary)
     targets = y.float()
     if (not self.is_eval_classifier
-        and getattr(self.config.training_classifier, 'use_label_smoothing', False)):
-      eps = getattr(self.config.training_classifier, 'label_smoothing_eps', 0.1)
-      targets = targets * (1 - eps) + (1 - targets) * eps
+        and getattr(self.config.training_classifier, 'use_label_smoothing', False)
+        and prefix == 'train'):
+      mu   = getattr(self.config.training_classifier, 'label_smoothing_eps', 0.1)
+      var  = 0.005   # e.g. (std=0.1)**2; adjust as you like
+      temp = mu * (1 - mu) / var - 1
+      alpha = mu * temp
+      beta  = (1 - mu) * temp
+      dist = torch.distributions.Beta(alpha, beta)
+      eps = dist.sample(targets.shape).to(targets.device)
+      targets = targets * (1.0 - eps) + (1.0 - targets) * eps
 
     # I have deleted the FUDGE implementation, since it is only useful for autoregressive models (https://arxiv.org/pdf/2104.05218)
 
@@ -332,3 +343,15 @@ class Classifier(BaseDMModel):
                   on_epoch=True,
                   sync_dist=True)
     return loss
+  
+  def detokenize_batch(x0: torch.Tensor, tokenizer, *, skip_special_tokens: bool = True):
+    """
+    How to use:
+    texts = self.detokenize_batch(x0, self.tokenizer)
+
+    for i, txt in enumerate(texts[:3]):   # show first few examples
+      print(f"[sample {i}] {txt}")
+    """
+
+    input_ids = x0.detach().cpu().tolist()
+    return tokenizer.batch_decode(input_ids, skip_special_tokens=skip_special_tokens)
