@@ -161,11 +161,11 @@ def get_dataset(
   # -- 1 ▸ Check if the dataset is already cached and tokenized --
   tok_tag = re.sub(r"[^a-zA-Z0-9]+", "-",  # make it filename-safe
         tokenizer.name_or_path.split("/")[-1])
-  keys = [k for k in re.split(r"[,\s]+", subset_key) if k] if subset_key else ["whole dataset"]
+  keys = [k for k in re.split(r"[,\s]+", subset_key) if k] if subset_key else ["whole_dataset"]
   filename = f"{dataset_name}"
   if subset_key is not None:
     filename += "_"+"_".join(keys) if len(keys) > 0 else subset_key
-    filename += f"_{mode}_bs{block_size}_{tok_tag}"
+  filename += f"_{mode}_bs{block_size}_{tok_tag}"
   filename += '_wrapped.dat' if wrap else '_unwrapped.dat'
   _path = os.path.join(cache_dir, filename)
   
@@ -214,6 +214,17 @@ def get_dataset(
       'ag_news',
       cache_dir=cache_dir,
       streaming=streaming)
+  elif dataset_name == "lm1b":
+    import glob
+    base = config.data.path_to_data
+    train_files = glob.glob(os.path.join(base,
+                                         "training-monolingual.tokenized.shuffled", "*"))
+    valid_files = glob.glob(os.path.join(base,
+                                         "heldout-monolingual.tokenized.shuffled", "*"))
+    dataset = datasets.load_dataset(
+      "text",
+      data_files={"train": train_files,
+                  "test": valid_files})  # no streaming
   else:
     dataset = datasets.load_dataset(
       dataset_name,
@@ -224,6 +235,15 @@ def get_dataset(
     data = dataset
   elif dataset_name in ['arxiv_abstracts']:
     data = dataset["train"] if mode == 'train' else dataset["test"]
+  elif dataset_name in ['lm1b']:
+    data = dataset["train"] if mode == 'train' else dataset["test"]
+    # make src/tgt split
+    number_of_samples = int(len(data) * config.data.get("domain_fraction", 0.7))
+    if subset_key is not None:
+      if "src" in subset_key:
+        data = data.select(range(number_of_samples))
+      elif "tgt" in subset_key:
+        data = data.select(range(number_of_samples, len(data)))
   else:
     data = dataset[mode]
 
@@ -385,11 +405,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     check_batch_size_for_gpu(config)
 
   # chose the correct subset of dataset for target and source domain
-  if domain:
-    raw = config.data.get(f"{domain}_domain", None)
-    subset_key = raw if raw and raw.lower() != "none" else None
-  else:
-    subset_key = None
+  subset_key = utils.build_subset_key(config=config, domain=domain)
 
   # -- 2 ▸ Get the train and validation datasets --
   if skip_train:
@@ -401,6 +417,7 @@ def get_dataloaders(config, tokenizer, skip_train=False,
       mode='train',
       wrap=config.data.wrap,
       cache_dir=config.data.cache_dir,
+      streaming=config.data.streaming,
       config=config,
       block_size=config.model.length,
       subset_key=subset_key)
@@ -466,7 +483,8 @@ def get_dataloaders(config, tokenizer, skip_train=False,
     valid_loader.tokenizer = tokenizer
 
   pad_token = tokenizer.pad_token_id
-  print_number_of_tokens_and_samples(
+  if not skip_valid and not skip_train:
+    print_number_of_tokens_and_samples(
         train_set_buffer, valid_set_buffer, pad_token, subset_key=subset_key)
 
   return train_loader, valid_loader

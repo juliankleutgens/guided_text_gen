@@ -462,8 +462,9 @@ class DIT(nn.Module, huggingface_hub.PyTorchModelHubMixin):
       for i in range(len(self.blocks)):
         x = self.blocks[i](x, rotary_cos_sin, c, seqlens=None)
       x = self.output_layer(x, c)
-
     return x
+  
+
 class DITClassifier(nn.Module):
   def __init__(self, config, vocab_size, time_conditioning=False):
     super().__init__()

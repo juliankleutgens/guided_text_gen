@@ -32,14 +32,22 @@ omegaconf.OmegaConf.register_new_resolver(
 
 
 def _load_from_checkpoint(config, tokenizer):
-  if 'hf' in config.backbone:
-    return diffusion.Diffusion(
-      config, tokenizer=tokenizer).to('cuda')
+    init_kwargs = dict(config=config, tokenizer=tokenizer)
 
-  return diffusion.Diffusion.load_from_checkpoint(
-    config.eval.checkpoint_path,
-    tokenizer=tokenizer,
-    config=config)
+    # case 1 ─ plain HF backbone → never load a checkpoint
+    if "hf" in config.backbone:
+        model, _ = build_or_load(
+            diffusion.Diffusion, init_kwargs, ckpt_path=None, freeze=False)
+    # case 2 ─ use checkpoint if it exists
+    else:
+        model, _ = utils.build_or_load(
+            diffusion.Diffusion,
+            init_kwargs,
+            ckpt_path=config.eval.checkpoint_path,
+            freeze=False,          # or True if you want it frozen
+        )
+
+    return model.to("cuda")
 
 
 @L.pytorch.utilities.rank_zero_only
@@ -231,7 +239,7 @@ def train_ratio_pipeline(cfg: DictConfig, callbacks: list, wandb_logger, tokeniz
     )
 
     ratio_net, loaded_ratio = utils.build_or_load(
-        model_cls=ratio.RatioEstimator,
+        model_=ratio.RatioEstimator,
         init_kwargs=dict(
             config=cfg,
             tokenizer=train_ds_src.tokenizer,
@@ -267,16 +275,14 @@ def generate_samples(config, logger, tokenizer):
   stride_length = config.sampling.stride_length
   num_strides = config.sampling.num_strides
   for _ in range(config.sampling.num_sample_batches):
-    if config.sampling:
-      _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample(
-        stride_length=stride_length,
-        num_strides=num_strides,
+    if False and config.sampling:
+      _, intermediate_samples, _ = model.restore_model_and_semi_ar_sample( stride_length=stride_length,
+                                                                          num_strides=num_strides,
         dt=1 / config.sampling.steps)
       text_samples = intermediate_samples[-1]
 
     else:
-      samples = model.restore_model_and_sample(
-        num_steps=config.sampling.steps)
+      samples = model.restore_model_and_sample(num_steps=config.sampling.steps)
       text_samples = model.tokenizer.batch_decode(samples)
       model.compute_generative_perplexity(text_samples)
   print('Text samples:', text_samples)
@@ -290,17 +296,14 @@ def generate_samples(config, logger, tokenizer):
 def _ppl_eval(config, logger, tokenizer):
   logger.info('Starting Zero Shot Eval.')
 
-  model = _load_from_checkpoint(config=config,
-                                tokenizer=tokenizer)
+  model = _load_from_checkpoint(config=config,tokenizer=tokenizer)
   if config.eval.disable_ema:
     logger.info('Disabling EMA.')
     model.ema = None
 
   wandb_logger = None
   if config.get('wandb', None) is not None:
-    wandb_logger = L.pytorch.loggers.WandbLogger(
-      config=omegaconf.OmegaConf.to_object(config),
-      ** config.wandb)
+    wandb_logger = L.pytorch.loggers.WandbLogger(config=omegaconf.OmegaConf.to_object(config),** config.wandb)
   callbacks = []
   if 'callbacks' in config:
     for _, callback in config.callbacks.items():
@@ -311,8 +314,8 @@ def _ppl_eval(config, logger, tokenizer):
     callbacks=callbacks,
     strategy=hydra.utils.instantiate(config.strategy),
     logger=wandb_logger)
-  _, valid_ds = dataloader.get_dataloaders(
-    config, tokenizer, skip_train=True, valid_seed=config.seed)
+  domain = config.eval.get("domain", "src")
+  _, valid_ds = dataloader.get_dataloaders(config, tokenizer, skip_train=True,domain=domain, valid_seed=config.seed)
   trainer.validate(model, valid_ds)
 
 def change_config_if_debugging(config):
@@ -331,8 +334,7 @@ def change_config_if_debugging(config):
     config.trainer_ratio.val_check_interval = 1.0
     config.trainer.val_check_interval=2
     config.eval.disable_ema = True
-    config.sampling.steps = 10
-    config.sampling.num_sample_batches = 1
+    #config.sampling.num_sample_batches
     config.loader.global_batch_size = 16
     config.trainer.accumulate_grad_batches=1
     config.loader.persistent_workers = False

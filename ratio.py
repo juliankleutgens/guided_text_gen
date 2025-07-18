@@ -15,9 +15,10 @@ class RatioEstimator(BaseDMModel):
         self,
         config,
         tokenizer,                       # transformers.PreTrainedTokenizer
-        domain_classifier: nn.Module,
-        domain_classifier_time_dependent: nn.Module,
+        domain_classifier: typing.Union[nn.Module, None],
+        domain_classifier_time_dependent: typing.Union[nn.Module, None],
         pretrained_backbone: typing.Optional[nn.Module] = None,
+        inference_mode = False,  # for inference, no need to load noise schedule
     ):
         # --------------------------------------------------
         # 0 ▸ Minimal attributes required by BaseDMModel
@@ -54,9 +55,10 @@ class RatioEstimator(BaseDMModel):
         self.T         = config.T
 
         # --------------------------------------------------
-        # 4 ▸ Frozen auxiliary classifiers
-        self.domain_classifier = domain_classifier.eval().requires_grad_(False)
-        self.domain_classifier_t = domain_classifier_time_dependent.eval().requires_grad_(False)
+        # 4 ▸ Frozen auxiliary classifiers 
+        if not inference_mode:
+            self.domain_classifier = domain_classifier.eval().requires_grad_(False)
+            self.domain_classifier_t = domain_classifier_time_dependent.eval().requires_grad_(False)
 
         # --------------------------------------------------
         # 5 ▸ Ratio‑network backbone
@@ -66,12 +68,11 @@ class RatioEstimator(BaseDMModel):
             )
         else:
             raise NotImplementedError(
-                f"Ratio backbone '{config.ratio_backbone}' not implemented."
-            )
+                f"Ratio backbone '{config.ratio_backbone}' not implemented.")
         if pretrained_backbone is not None:
             self.ratio_model.load_pretrained_encoder(pretrained_backbone)
 
-        utils.print_num_parameters(self.ratio_model, print_prefix="Ratio model ")
+        #utils.print_num_parameters(self.ratio_model, print_prefix="Ratio model ")
 
         # --------------------------------------------------
         # 6 ▸ Noise schedule  (needs self.dtype)
@@ -217,3 +218,28 @@ class RatioEstimator(BaseDMModel):
             'name': 'trainer/lr',
         }
         return [optimizer], [scheduler_dict]
+
+    def get_log_probs(
+        self,
+        x_t: torch.Tensor,          # now likely on CPU
+        batch_size: int,
+        sigma: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        Compute log-probs in batches, copying each slice to the model’s device.
+        """
+        device = next(self.parameters()).device
+        chunks = []
+        for start in range(0, x_t.size(0), batch_size):
+            end = start + batch_size
+
+            # move the slice & σ to GPU *only for this mini-batch*
+            ids   = x_t[start:end].to(device, non_blocking=True)
+            sig   = sigma[start:end].to(device, non_blocking=True)
+
+            with torch.no_grad():                       # inference only
+                logits = self.forward(ids, sig)         # (b, L, V)
+
+            chunks.append(torch.log_softmax(logits, dim=-1).cpu())  # back to CPU
+
+        return torch.cat(chunks, dim=0)    

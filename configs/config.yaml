@@ -3,7 +3,7 @@ defaults:
   - _self_
   - /callbacks: [checkpoint_every_n_steps, checkpoint_monitor, learning_rate_monitor]
   - /data: openwebtext
-  - /model: small
+  - /model: tiny
   - /strategy: ddp
   - /noise: loglinear
   - /lr_scheduler: cosine_decay_warmup
@@ -21,7 +21,7 @@ backbone: dit                            # options: dit | dimamba
 classifier_backbone: dit                 # options: dit | dimamba
 ratio_backbone: dit
 parameterization: subs                   # options: subs | d3pm | sedd
-time_conditioning: true                  # if true, σₜ is passed into backbone
+time_conditioning: true                  # if true, σₜ is passed into backbone while sampling
 T: 0                                     # 0 = continuous time, 1000 = discrete steps
 subs_masking: false                      # true: mask‑only (MLDM) | false: full substitution (D3PM)
 debug: false                             # true: only 10 steps for training and only 200 Samples, for debugging 
@@ -44,15 +44,18 @@ loader:
 # =====================
 #  Sampling
 # =====================
-sampling:
+sampling:  
   predictor: ddpm_cache                  # options: analytic | ddpm | ddpm_cache
   steps: 128
   noise_removal: true
-  num_sample_batches: 2                  # total samples = num_gpus * loader.eval_batch_size * num_sample_batches
+  num_sample_batches: 2                # total samples = num_gpus * loader.eval_batch_size * num_sample_batches
   num_sample_log: 2
   semi_ar: false
   stride_length: 1
-  num_strides: 1
+  num_strides: 0
+  guided_sampling: false
+  guidance_scale: 1.0                   # only used if guided_sampling is true
+  batch_size_ratio: 1024                   # batch size for ratio model sampling, e.g., 1 for single GPU, 8 for 8 GPUs
 
 # =====================
 #  Training (common anchor)
@@ -88,6 +91,7 @@ eval:
   compute_perplexity_on_sanity: false
   gen_ppl_eval_model_name_or_path: gpt2-large   # e.g. gpt2-large | meta-llama/Llama-2-7b-hf
   generate_samples: true
+  domain: tgt                     # options: src | tgt
 
 # =====================
 #  Optimizer

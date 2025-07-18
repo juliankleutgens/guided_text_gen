@@ -12,9 +12,11 @@ import lightning
 import torch
 from timm.scheduler import CosineLRScheduler
 import copy
+import typing
 from pathlib import Path
 import yaml, hydra, os
 import lightning.pytorch as pl
+from typing import Optional, Tuple, Dict, Any
 
 
 def filter_arxiv_dataset_by_domain(dataset, domain_keys):
@@ -330,36 +332,42 @@ def print_num_parameters(model: torch.nn.Module, verbose: bool = True, print_pre
         print(f"{print_prefix}Trainable parameters: {trainable_params:,}")
 
 
-import os
-import torch
 
-def build_or_load(model_cls, init_kwargs, ckpt_path=None, freeze=False):
+def build_or_load(
+    model_, 
+    init_kwargs: Dict[str, Any], 
+    ckpt_path: Optional[str] = None, 
+    freeze: bool = False
+) -> Tuple[torch.nn.Module, bool]:
     """
-    Loads model from checkpoint if available, otherwise initializes a new one.
-    If loaded, checks only specific config attributes for consistency.
+    Load `model_` from `ckpt_path` if the file exists; otherwise create a
+    fresh instance.
+
+    * Extra tensors present in the checkpoint but absent in the current
+      model definition are silently discarded.
+    * The original attribute-consistency check remains unchanged.
     """
-    # 1) load or init
+    # ---------------------------------------------------- 1) create model
+    model = model_(**init_kwargs)
+    loaded = False
+
+    # ---------------------------------------------------- 2) restore weights (if any)
     if ckpt_path and os.path.exists(ckpt_path):
-        model = model_cls.load_from_checkpoint(ckpt_path, **init_kwargs)
+        checkpoint = torch.load(ckpt_path, map_location="cpu")
+        sd_ckpt: Dict[str, torch.Tensor] = checkpoint["state_dict"]
+
+        # keep only parameters that exist in the current model
+        current_keys = set(model.state_dict().keys())
+        sd_filtered = {k: v for k, v in sd_ckpt.items() if k in current_keys}
+
+        model.load_state_dict(sd_filtered, strict=False)
         loaded = True
-    else:
-        model = model_cls(**init_kwargs)
-        loaded = False
 
-    # 2) sanity‐check: right class
-    if loaded and not isinstance(model, model_cls):
-        raise TypeError(
-            f"Checkpoint at '{ckpt_path}' contains a "
-            f"{type(model).__name__}; expected {model_cls.__name__}"
-        )
-
-    # 3) if loaded, compare only the chosen attrs
+    # ---------------------------------------------------- 3) sanity-check unchanged
     if loaded:
-        # Instantiate a fresh model to compare against
-        model_scratch = model_cls(**init_kwargs)
+        model_scratch = model_(**init_kwargs)
         keys_to_check = ["time_conditioning", "T", "change_of_variables"]
         for key in keys_to_check:
-            # only if the attribute actually exists on the model
             if hasattr(model_scratch, key) and hasattr(model, key):
                 before = getattr(model_scratch, key)
                 after  = getattr(model, key)
@@ -368,8 +376,9 @@ def build_or_load(model_cls, init_kwargs, ckpt_path=None, freeze=False):
                         f"Checkpoint at '{ckpt_path}' has a different value for "
                         f"'{key}': checkpoint={after} vs fresh={before}"
                     )
+        print(f"Loaded model from {ckpt_path} with {len(sd_filtered)} parameters.")
 
-    # 4) optionally freeze
+    # ---------------------------------------------------- 4) optionally freeze
     if freeze and loaded:
         for p in model.parameters():
             p.requires_grad = False
@@ -397,3 +406,188 @@ def _callbacks_for(subdir: str, checkpoint_save_dir: str, callbacks, monitor_met
         cbs.append(cb_new)
     return cbs
 
+
+def build_subset_key(
+    config: typing.Any,                     # your Hydra/argparse config object
+    domain: typing.Union[str, None]         # "src", "tgt", or None
+) -> typing.Optional[str]:
+    """
+    Derive a deterministic `subset_key` for dataset filtering.
+
+    Rules
+    -----
+    1. If `domain` is None                   → return None.
+    2. Base key:  config.data["<domain>_domain"]
+       (ignored if missing, empty, or the string "none").
+    3. Optional fraction:
+       * If config.data["domain_fraction"] exists and is in (0, 1]:
+         - For "src": use `fraction`
+         - For "tgt": use `1 - fraction`
+         - Append "<domain>_<percent>" (e.g. "src_70") to the base key.
+    """
+    if domain is None:
+        return None
+
+    data_cfg = getattr(config, "data", {})          # safe even if .data absent
+
+    # --- base key -----------------------------------------------------------
+    raw_val = str(data_cfg.get(f"{domain}_domain", "")).strip()
+    base_key: Optional[str] = None
+    if raw_val and raw_val.lower() != "none":
+        base_key = raw_val
+
+    # --- optional fraction --------------------------------------------------
+    frac = data_cfg.get("domain_fraction")          # may be None
+    if frac is None:
+        return base_key
+
+    if not 0 < frac <= 1:
+        raise ValueError("domain_fraction must be in (0, 1].")
+
+    frac = 1 - frac if domain == "tgt" else frac
+    suffix = f"{domain}_{int(frac * 100)}"          # e.g. "tgt_30"
+
+    return f"{base_key}_{suffix}" if base_key else suffix
+
+
+def old_get_ratio_log_stream(self, xt, sigma, chunk_v: int = 1024):
+    """
+    Compute log-prob correction terms from the ratio model, but *only* for
+    sequence positions that are currently MASK tokens in at least one item
+    of the batch. Unmasked positions are left at 0.0 log-ratio (i.e., neutral).
+    """
+    B, L = xt.shape
+    V = self.vocab_size
+
+    # Handle DataParallel-wrapped ratio_model
+    ratio_model = self.ratio_model.module if isinstance(self.ratio_model, torch.nn.DataParallel) else self.ratio_model
+    device = next(ratio_model.parameters()).device
+
+    # Allocate result (neutral log-factor = 0)
+    ratio_log = torch.zeros((B, L, V), device=device, dtype=torch.float32)
+
+    # Move inputs to CPU for expansion
+    base_cpu  = xt.to("cpu", non_blocking=True)
+    sigma_cpu = sigma.to("cpu", non_blocking=True)
+
+    # Identify which columns contain at least one MASK
+    mask_cols = (base_cpu == self.mask_index).any(dim=0).nonzero(as_tuple=False).flatten().tolist()
+    if len(mask_cols) == 0:
+        # Nothing to guide; return neutral ratios.
+        return ratio_log
+
+    # Pre-build a [0..n-1] index once per chunk_v loop (built in loop below)
+    for pos in tqdm(mask_cols, desc="ratio-mask-cols"):
+        for v0 in range(0, V, chunk_v):
+            v1 = min(v0 + chunk_v, V)
+            n  = v1 - v0
+
+            # (B, n, L) -> (B*n, L)
+            tmp = base_cpu.unsqueeze(1).repeat(1, n, 1).view(-1, L)
+            tmp[:, pos] = torch.arange(v0, v1).repeat(B)
+
+            with torch.no_grad():
+                logits = ratio_model(
+                    tmp.cuda(non_blocking=True),
+                    sigma_cpu.repeat_interleave(n).cuda(non_blocking=True)
+                )
+
+            # Expect (B*n, L, V) or (B*n, V_pos) fallback
+            logits_pos = logits[:, pos, :] if logits.dim() == 3 else logits
+            ratio_log[:, pos, v0:v1] = logits_pos.view(B, n)
+
+        # Normalize *this* column over vocab.
+        ratio_log[:, pos, :] = torch.log_softmax(ratio_log[:, pos, :], dim=-1)
+
+    return ratio_log
+
+
+
+def get_ratio_log_stream(self, xt, sigma, chunk_v: int = 1024):
+    """
+    Per-sample ratio scores over vocab **only at masked positions**.
+
+    For each sample b and each position pos where xt[b,pos] == MASK,
+    we evaluate the ratio model on n candidate substitutions in vocab
+    chunks, gather the logit corresponding to the candidate token we
+    actually injected, and write that scalar into ratio_log[b,pos,v].
+
+    Unmasked positions receive 0.0 (log 1) so they are neutral when
+    added (scaled) into guided_log_probs downstream.
+
+    Args:
+        xt:    (B, L) int64 tokens (any device).
+        sigma: (B,) or (B,1) float timestep conditioning.
+        chunk_v: vocab slice size processed per forward pass.
+
+    Returns:
+        ratio_log: (B, L, V) float32 tensor on ratio_model device.
+                   Masked rows: log-softmaxed over vocab.
+                   Unmasked rows: zeros.
+    """
+    B, L = xt.shape
+    V = self.vocab_size
+
+    # unwrap DataParallel
+    ratio_model = self.ratio_model.module if isinstance(self.ratio_model, torch.nn.DataParallel) else self.ratio_model
+    device = next(ratio_model.parameters()).device
+
+    # make sure sigma is 1D float tensor per batch item
+    sigma = sigma.squeeze(-1) if sigma.ndim > 1 else sigma
+    assert sigma.shape[0] == B, sigma.shape
+
+    # allocate neutral log factors
+    ratio_log = torch.zeros((B, L, V), device=device, dtype=torch.float32)
+
+    # work from CPU base copies to save GPU mem during expansion
+    base_cpu  = xt.to("cpu", non_blocking=True)
+    sigma_cpu = sigma.to("cpu", non_blocking=True)
+    torch.cuda.synchronize()  # explicit barrier before using xt_cpu
+
+    for b in range(B):
+        
+        row = base_cpu[b].clone()           # (L,)
+        sig = sigma_cpu[b]          # scalar
+
+        # which positions in THIS sample are masked?
+        num_masks_per_row = (base_cpu == self.mask_index).sum(dim=1)
+        mask_pos = (row == self.mask_index).nonzero(as_tuple=False).flatten()
+        if mask_pos.numel() == 0:
+            continue  # nothing to do for this sample
+
+        # loop masked positions
+        for pos in tqdm(mask_pos, desc=f"Ratio {b}"):
+            # fill vocab in chunks
+            for v0 in range(0, V, chunk_v):
+                v1 = min(v0 + chunk_v, V)
+                n  = v1 - v0
+
+                # build n mutated sequences (n, L)
+                tmp = row.unsqueeze(0).repeat(n, 1)        # clone row n times
+                tmp[:, pos] = torch.arange(v0, v1)         # inject candidates
+
+                with torch.no_grad():
+                    logits = ratio_model(
+                        tmp.to(device, non_blocking=True),
+                        sig.repeat(n).to(device, non_blocking=True),
+                    )  # expect (n, L, V) or (n, V)
+
+                # take logits for this position
+                if logits.dim() == 3:
+                    logits_pos = logits[:, pos, :]   # (n, V)
+                else:
+                    logits_pos = logits              # (n, V)
+
+                # we only need the score of the candidate token we injected
+                cand_ids = torch.arange(v0, v1, device=logits_pos.device)  # (n,)
+                # gather per-row candidate score
+                # shape (n,) — one score per candidate
+                cand_scores = logits_pos.gather(1, cand_ids.unsqueeze(1)).squeeze(1)
+
+                # write into output buffer
+                ratio_log[b, pos, v0:v1] = cand_scores
+
+            # normalize this (b,pos) row over full vocab
+            ratio_log[b, pos, :] = torch.log_softmax(ratio_log[b, pos, :], dim=-1)
+
+    return ratio_log
